@@ -42,6 +42,13 @@ public sealed class RemoteLoader : IDisposable
     private static readonly Vector Dpi = new(96, 96);
     private const string DotnetHostName = "Avalonia.Designer.HostApp.dll";
 
+    // Ordered by preference. See FindDesignerHost.
+    private static readonly string[] HostFrameworkPreference = { "net8.0", "net10.0", "netstandard2.0" };
+
+    private static readonly object _nugetSync = new();
+    private static string? _nugetRoot;
+    private static bool _nugetRootResolved;
+
     private readonly object _startSync = new();
     private readonly object _outputSync = new();
     private readonly List<string> _output = new();
@@ -182,7 +189,7 @@ public sealed class RemoteLoader : IDisposable
                     }
                 }
 
-                list.Sort();
+                list.Sort(CompareVersions);
 
                 // Warnings disabled. See editor config
                 return list.ToArray();
@@ -199,29 +206,46 @@ public sealed class RemoteLoader : IDisposable
     /// <exception cref="FileNotFoundException">Unable to locate remote preview host</exception>
     public static PathItem FindDesignerHost(string? version)
     {
-        // This should work under both Windows and Linux (MacOS?)
-        // ~/.nuget/packages/avalonia/<avalonia-version>/tools/netcoreapp2.0/designer/Avalonia.Designer.HostApp.dll
+        // Fallback only. MSBuild states the host path outright - see
+        // MsBuildEvaluator.PreviewerToolPathProperty - and that is used in preference. This runs
+        // where a project could not be evaluated, and cannot see a NuGet globalPackagesFolder set
+        // in nuget.config.
+        // ~/.nuget/packages/avalonia/<avalonia-version>/tools/<tfm>/designer/Avalonia.Designer.HostApp.dll
         ArgumentException.ThrowIfNullOrWhiteSpace(version);
 
         var src = GetAvaloniaPackagesDirectory();
 
         if (src != null)
         {
-            src = Path.Combine(src, version);
-            src = Path.Combine(src, "tools");
+            var tools = Path.Combine(Path.Combine(src, version), "tools");
 
-            // From here on in, we'll find it (adds a little flexibility).
-            // Currently, there will be only one instance.
-            var node = new NodeItem(src, PathKind.Directory);
+            // Resolve the known layouts explicitly rather than taking whatever a recursive search
+            // happens to reach first. Avalonia 12 ships two designer hosts, net8.0 and net10.0, and
+            // net8.0 is preferred because net8 IL rolls forward onto a net10 runtime while the
+            // reverse fails outright on System.Runtime. Avalonia's own props defaults to net8.0
+            // for the same reason. 11.x ships netstandard2.0 alone.
+            foreach (var tfm in HostFrameworkPreference)
+            {
+                var path = Path.Combine(Path.Combine(Path.Combine(tools, tfm), "designer"), DotnetHostName);
+
+                if (File.Exists(path))
+                {
+                    return new PathItem(path, PathKind.Assembly);
+                }
+            }
+
+            // Unknown layout - a version newer than anything anticipated here. Search rather than
+            // fail, accepting that the choice is arbitrary where there is more than one candidate.
+            var node = new NodeItem(tools, PathKind.Directory);
             node.Properties.ShowEmptyDirectories = false;
             node.Properties.FilePatterns = DotnetHostName;
             node.Refresh();
 
-            var path = node.FindFile(DotnetHostName, StringComparison.OrdinalIgnoreCase);
+            var found = node.FindFile(DotnetHostName, StringComparison.OrdinalIgnoreCase);
 
-            if (path != null)
+            if (found != null)
             {
-                return path;
+                return found;
             }
         }
 
@@ -319,20 +343,139 @@ public sealed class RemoteLoader : IDisposable
         }
     }
 
+    /// <summary>
+    /// Compares two version directory names. Needed because an ordinal sort places "11.3.12" below
+    /// "11.3.2". Names carrying a pre-release suffix compare on their numeric part first.
+    /// </summary>
+    private static int CompareVersions(string a, string b)
+    {
+        if (Version.TryParse(StripPreRelease(a), out Version? va) &&
+            Version.TryParse(StripPreRelease(b), out Version? vb))
+        {
+            int rslt = va.CompareTo(vb);
+
+            if (rslt != 0)
+            {
+                return rslt;
+            }
+        }
+
+        return string.CompareOrdinal(a, b);
+    }
+
+    private static string StripPreRelease(string version)
+    {
+        int pos = version.IndexOf('-');
+        return pos > 0 ? version.Substring(0, pos) : version;
+    }
+
     private static string? GetAvaloniaPackagesDirectory()
     {
-        string? src = Environment.GetEnvironmentVariable("NUGET_PACKAGES");
-
-        if (string.IsNullOrEmpty(src))
-        {
-            src = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-            src = Path.Combine(src, ".nuget");
-            src = Path.Combine(src, "packages");
-        }
+        var src = GetNugetPackagesRoot();
 
         if (!string.IsNullOrEmpty(src))
         {
             return Path.Combine(src, "avalonia");
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Locates the NuGet global packages folder. The environment variable is only one of three
+    /// ways it can be set - a nuget.config globalPackagesFolder is invisible to it, and asking the
+    /// CLI is the only reliable way to see that. The CLI call costs around a second, so the answer
+    /// is cached for the process lifetime.
+    /// </summary>
+    private static string? GetNugetPackagesRoot()
+    {
+        var src = Environment.GetEnvironmentVariable("NUGET_PACKAGES");
+
+        if (!string.IsNullOrEmpty(src))
+        {
+            return src;
+        }
+
+        lock (_nugetSync)
+        {
+            if (!_nugetRootResolved)
+            {
+                _nugetRootResolved = true;
+                _nugetRoot = QueryNugetPackagesRoot();
+
+                if (string.IsNullOrEmpty(_nugetRoot))
+                {
+                    var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                    _nugetRoot = Path.Combine(Path.Combine(home, ".nuget"), "packages");
+                }
+
+                Debug.WriteLine("NuGet packages root: " + _nugetRoot);
+            }
+
+            return _nugetRoot;
+        }
+    }
+
+    private static string? QueryNugetPackagesRoot()
+    {
+        try
+        {
+            var dotnet = Environment.GetEnvironmentVariable("DOTNET_HOST_PATH");
+
+            if (string.IsNullOrEmpty(dotnet))
+            {
+                dotnet = "dotnet";
+            }
+
+            var info = new ProcessStartInfo
+            {
+                Arguments = "nuget locals global-packages --list",
+                CreateNoWindow = true,
+                FileName = dotnet,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+
+            using var proc = Process.Start(info);
+
+            if (proc == null)
+            {
+                return null;
+            }
+
+            var output = proc.StandardOutput.ReadToEndAsync();
+
+            if (!proc.WaitForExit(15000))
+            {
+                proc.Kill(true);
+                return null;
+            }
+
+            if (proc.ExitCode != 0)
+            {
+                return null;
+            }
+
+            // "global-packages: C:\Users\me\.nuget\packages\"
+            foreach (var line in output.Result.Split('\n'))
+            {
+                int pos = line.IndexOf(':');
+
+                if (pos > 0 && line.AsSpan(0, pos).Trim().EndsWith("global-packages", StringComparison.OrdinalIgnoreCase))
+                {
+                    var path = line.Substring(pos + 1).Trim();
+
+                    if (path.Length != 0 && Directory.Exists(path))
+                    {
+                        return path;
+                    }
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            Debug.WriteLine("Failed to query NuGet packages root: " + e.Message);
         }
 
         return null;
@@ -452,11 +595,11 @@ public sealed class RemoteLoader : IDisposable
             StopNoSync();
         }
 
-        Debug.WriteLine("Find host for Avalonia: " + load.AppAvaloniaVersion);
-        var host = FindDesignerHost(load.AppAvaloniaVersion);
+        var host = ResolveDesignerHost(load);
         Debug.WriteLine("Host: " + host.FullName);
 
-        var port = GetFreePort();
+        // Binds the listener as well, because the port number has to go into the host command line.
+        var port = StartListenerNoSync();
 
         // Locate dotnet
         // https://github.com/dotnet/docs/blob/main/docs/core/tools/dotnet-environment-variables.md#dotnet_host_path
@@ -473,7 +616,6 @@ public sealed class RemoteLoader : IDisposable
         var args = $@"exec --runtimeconfig ""{load.AppConfigPath}"" --depsfile ""{load.AppDepsPath}"" ""{host}"" --transport tcp-bson://127.0.0.1:{port}/ --method avalonia-remote ""{load.AppAssembly}""";
 
         Debug.WriteLine($"STARTING: {dotnet} {args}");
-        v_listener = new BsonTcpTransport().Listen(IPAddress.Loopback, port, c => { v_connection = c; });
 
         var info = new ProcessStartInfo
         {
@@ -523,6 +665,61 @@ public sealed class RemoteLoader : IDisposable
         }
 
         Debug.WriteLine("Connection OK");
+    }
+
+    /// <summary>
+    /// Binds the transport listener and returns the port it is on. <see cref="GetFreePort"/> closes
+    /// its probe listener before this one binds, so another process can take the port in between;
+    /// retry rather than fail a preview on a race a second attempt almost certainly wins.
+    /// </summary>
+    private int StartListenerNoSync()
+    {
+        Exception? last = null;
+
+        for (int n = 0; n < 5; ++n)
+        {
+            int port = GetFreePort();
+
+            try
+            {
+                v_listener = new BsonTcpTransport().Listen(IPAddress.Loopback, port, c => { v_connection = c; });
+                return port;
+            }
+            catch (SocketException e)
+            {
+                Debug.WriteLine($"Port {port} unavailable: {e.Message}");
+                last = e;
+            }
+        }
+
+        throw last ?? new InvalidOperationException("Failed to open a listening port");
+    }
+
+    /// <summary>
+    /// Returns the designer host to launch. MSBuild's answer is preferred; the NuGet cache lookup
+    /// is the fallback for a project that could not be evaluated.
+    /// </summary>
+    private static PathItem ResolveDesignerHost(LoadPayload load)
+    {
+        var tool = load.AppPreviewerToolPath;
+
+        if (!string.IsNullOrEmpty(tool) && File.Exists(tool))
+        {
+            Debug.WriteLine("Host from MSBuild: " + tool);
+            return new PathItem(tool, PathKind.Assembly);
+        }
+
+        Debug.WriteLine("Find host for Avalonia: " + load.AppAvaloniaVersion);
+
+        if (!IsAvaloniaVersion(load.AppAvaloniaVersion))
+        {
+            // Neither route has an answer. Say which, rather than reporting a version of "".
+            throw new FileNotFoundException(
+                "Cannot locate the Avalonia designer host - the project has no evaluated previewer " +
+                "path and no detected Avalonia version. Restore and build the project.");
+        }
+
+        return FindDesignerHost(load.AppAvaloniaVersion);
     }
 
     private bool SendScale(IAvaloniaRemoteTransportConnection? cnx, double scale)

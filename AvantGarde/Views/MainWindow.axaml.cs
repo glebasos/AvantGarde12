@@ -83,8 +83,8 @@ public partial class MainWindow : AvantWindow<MainWindowViewModel>
         opts.Title = "Open Solution or Project";
         opts.AllowMultiple = false;
 
-        var type = new FilePickerFileType("Solution (*.sln; *.csproj; *.fsproj)");
-        type.Patterns = new string[] { "*.sln", "*.csproj", "*.fsproj" };
+        var type = new FilePickerFileType("Solution (*.sln; *.slnx; *.csproj; *.fsproj)");
+        type.Patterns = new string[] { "*.sln", "*.slnx", "*.csproj", "*.fsproj" };
         opts.FileTypeFilter = new FilePickerFileType[] { type };
 
         var paths = await StorageProvider.OpenFilePickerAsync(opts);
@@ -113,6 +113,7 @@ public partial class MainWindow : AvantWindow<MainWindowViewModel>
             }
 
             ExplorerPane.Solution = sol;
+            StartEvaluation();
             ResetWatcher(ExplorerPane.SelectedProject);
             PreviewPane.HasSolution = true;
             PreviewPane.IsPreviewSuspended = false;
@@ -424,6 +425,15 @@ public partial class MainWindow : AvantWindow<MainWindowViewModel>
 
     private void UpdateLoader(PathItem? item)
     {
+        if (ExplorerPane.Solution?.IsEvaluating == true)
+        {
+            // Hold off until MSBuild has answered. Previewing now would start the designer host
+            // against project values about to be superseded, and then restart it moments later.
+            Debug.WriteLine("LOAD UPDATE DEFERRED - evaluating");
+            _loader.Update(new LoadPayload(new ProjectError("Resolving project...")));
+            return;
+        }
+
         if (_buildWatcher == null || _buildWatcher.Elapsed > RefreshInterval)
         {
             Debug.WriteLine("");
@@ -491,11 +501,59 @@ public partial class MainWindow : AvantWindow<MainWindowViewModel>
         }
     }
 
+    /// <summary>
+    /// Queues an MSBuild evaluation of the open solution on a worker thread, where one is needed.
+    /// Never blocks the UI thread - a cold evaluation is around half a second per project.
+    /// </summary>
+    private void StartEvaluation()
+    {
+        var sol = ExplorerPane.Solution;
+
+        if (sol == null || !sol.BeginEvaluation())
+        {
+            return;
+        }
+
+        Debug.WriteLine("START EVALUATION");
+
+        // Show the resolving state now. BeginEvaluation has already marked the projects.
+        ExplorerPane.Refresh(true);
+
+        Task.Run(() =>
+        {
+            try
+            {
+                sol.Evaluate();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine(ex);
+            }
+
+            Dispatcher.UIThread.Post(() =>
+            {
+                if (ExplorerPane.Solution == sol)
+                {
+                    Debug.WriteLine("EVALUATION COMPLETE");
+                    ExplorerPane.Refresh(true);
+                    UpdateLoader(ExplorerPane.SelectedItem);
+                }
+            });
+        });
+    }
+
     private void RefreshTimerHandler(object? _, EventArgs e)
     {
         try
         {
             bool refreshed = ExplorerPane.Refresh();
+
+            if (ExplorerPane.Solution?.NeedsEvaluation == true)
+            {
+                // A project file, Directory.Build.props or Directory.Packages.props changed since
+                // the last evaluation, or the build configuration was switched.
+                StartEvaluation();
+            }
 
             if (_buildWatcher == null)
             {

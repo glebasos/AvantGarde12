@@ -15,6 +15,9 @@ previewer compatibility — that is Milestones 1 and 2.
 - **[AvantGarde/docs/milestone-0-result.md](AvantGarde/docs/milestone-0-result.md)** — the spike
   outcome that orders milestones 1 and 2, plus corrections to the plan's facts table. Read before
   acting on PLAN.md's `tools/` layout claims.
+- **[AvantGarde/docs/milestone-1-result.md](AvantGarde/docs/milestone-1-result.md)** — the MSBuild
+  discovery spine as built, with three probe findings (notably: the MSBuild `AvaloniaVersion`
+  property is a trap) and the list of known-and-deliberately-unfixed issues.
 - **[AvantGarde/docs/milestone-3-result.md](AvantGarde/docs/milestone-3-result.md)** — what the
   Avalonia 12 migration actually changed, which predicted breakage never happened, and what is still
   unverified.
@@ -37,21 +40,24 @@ Dependency outcomes, which differ from what PLAN.md assumes:
 Lesson from the first two: when an Avalonia-adjacent package looks absent on 12, check for a rename
 before concluding it was discontinued.
 
-**Milestone 0 is done** — differential probe *and* in-app round trip, both written up in the
-milestone-0 note. Headline: a restored, built `AvaloniaMvvm` **previews correctly today**, frames and
-all, on the 12.1.0 build. Every failure observed is **discovery**, never protocol, so **Milestone 1
-is next** and Milestone 2 is not what blocks users. Three discovery failures are on record:
+**Milestones 0, 1 and 3 are done.** Both 12.0.5 fixtures preview correctly end to end, including the
+two-assembly path, with no fixture modification. Every Milestone 0 failure was **discovery**, never
+protocol, and Milestone 1 retired all three (version resolution, `TargetFramework` in
+`Directory.Build.props`, host-TFM selection).
 
-1. version resolution — `FindDesignerHost` exact-matches `<nugetRoot>/avalonia/<version>`, absent
-   until the user's project is restored;
-2. `TargetFramework` declared in `Directory.Build.props` is invisible to the csproj XML parse, so
-   *every* project in `MultiProjectSolution` reports "assembly not found" while fully built — this is
-   Milestone 1's acceptance test;
-3. host TFM selection — a `net10.0` host against a `net8.0` app dies on `System.Runtime`. Measured:
-   AvantGarde does pick `net8.0` today, by traversal-order accident. Latent, not live.
+**`dotnet msbuild -getProperty:` is now the spine.** `MsBuildEvaluator` supplies `TargetFramework`,
+`TargetPath`, `OutputType`, `ProjectAssetsFile` and — crucially —
+`AvaloniaPreviewerNetCoreToolPath`, which locates the designer host directly. The project XML parse
+and `RemoteLoader.FindDesignerHost` survive **only as fallbacks** for a project that cannot be
+evaluated. Do not reintroduce XML parsing as a "fast path".
 
-The two-assembly path and the whole protocol round trip are **verified working on 12.0.5** once
-discovery is unblocked. Don't re-verify them; don't rebuild them.
+Evaluation costs ~0.6 s per project, so it is worker-thread only: `BeginEvaluation()` on the UI
+thread marks projects and shows "Resolving project...", then `Evaluate()` runs on a worker, then
+`Refresh()` applies. `UpdateLoader` defers previewing while it is in flight.
+
+**Milestone 2 is next**, but note it is not what blocks users — nothing observed in Milestone 0
+pointed at the protocol. Its strongest justification is real though: the host sends
+`RequestViewportResizeMessage` three times per preview and `MessageHandler` drops it silently.
 
 The three Milestone 0 diagnostics in `RemoteLoader.cs` (explicit `--method avalonia-remote`; buffer
 all host output; capture output before `StopNoSync()`) are committed. Don't reimplement them — see
@@ -88,7 +94,7 @@ Everything before `808f084 v1.6.0` is upstream; the `wip` commits on top are thi
 
 ```
 dotnet build AvantGarde.sln          # must stay clean, zero new warnings
-dotnet test AvantGarde.Test          # ~35 facts; zero coverage of Loading/ today
+dotnet test AvantGarde.Test          # 64 facts; still zero coverage of Loading/
 ```
 
 Two Avalonia 12.0.5 fixtures, in **different** places — the second is not where PLAN.md says:

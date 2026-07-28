@@ -124,6 +124,75 @@ public class DotnetProjectTest(ITestOutputHelper helper) : TestUtilBase(helper)
     }
 
     [Fact]
+    public void Evaluate_SuppliesTargetFrameworkTheXmlParseCannotSee()
+    {
+        // TargetFramework declared only in Directory.Build.props. Without MSBuild evaluation the
+        // framework is empty, the assembly search bails on its first guard, and a fully built
+        // project reports "assembly not found".
+        CreateFileContent("Directory.Build.props",
+            "<Project><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>");
+
+        var path = CreateFileContent("Name.Test.csproj",
+            "<Project Sdk=\"Microsoft.NET.Sdk\"><ItemGroup>" +
+            "<PackageReference Include=\"Avalonia\" Version=\"12.0.5\"/></ItemGroup></Project>");
+
+        var binDir = Path.Combine(Scratch, "bin", "Debug", "net8.0");
+        Directory.CreateDirectory(binDir);
+        CreateFileContent(Path.Combine(binDir, "Name.Test.dll"), "Dummy");
+
+        var item = new DotnetProject(path);
+        item.Refresh();
+
+        // Before evaluation
+        Assert.Empty(item.TargetFramework);
+        Assert.Null(item.AssemblyPath);
+        Assert.True(item.NeedsEvaluation);
+
+        item.Evaluate();
+        Assert.False(item.NeedsEvaluation);
+        Assert.True(item.Refresh());
+
+        Assert.Equal("net8.0", item.TargetFramework);
+        Assert.True(item.AssemblyPath?.Exists == true);
+        Assert.Equal(Path.Combine(binDir, "Name.Test.dll"), item.AssemblyPath?.FullName);
+    }
+
+    [Fact]
+    public void Evaluate_UnrestoredProjectReportsRestore()
+    {
+        CreateFileContent("Directory.Build.props",
+            "<Project><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>");
+
+        var path = CreateFileContent("Name.Test.csproj",
+            "<Project Sdk=\"Microsoft.NET.Sdk\"><ItemGroup>" +
+            "<PackageReference Include=\"Avalonia\" Version=\"12.0.5\"/></ItemGroup></Project>");
+
+        var item = new DotnetProject(path);
+        item.Evaluate();
+        item.Refresh();
+
+        // Actionable, rather than the "assembly not found" or FileNotFoundException that an
+        // unrestored project produced before.
+        Assert.False(item.IsRestored);
+        Assert.Null(item.PreviewerToolPath);
+        Assert.Equal("Project not restored", item.Error?.Message);
+    }
+
+    [Fact]
+    public void Evaluate_MissingProjectReportsFailure()
+    {
+        var path = CreateFileContent("Name.Test.csproj", ProjectNet6);
+        var item = new DotnetProject(path);
+
+        File.Delete(path);
+        item.Evaluate();
+        item.Refresh();
+
+        Assert.NotNull(item.Evaluation);
+        Assert.False(item.Evaluation.IsSuccess);
+    }
+
+    [Fact]
     public void Refresh_Artifacts()
     {
         var solDir = Path.Combine(Scratch, "Solution");

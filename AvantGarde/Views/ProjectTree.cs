@@ -149,6 +149,11 @@ namespace AvantGarde.Views
             TreeViewItem? selected = null;
             List<TreeViewItem>? items = null;
 
+            // Hold the selection as data across the rebuild. Every container is replaced here, and
+            // the IsSelected flag carried over from the old container below is unreliable for
+            // nested items - relying on it alone silently drops the selection on refresh.
+            var current = SelectedItem;
+
             if (_solution != null)
             {
                 items = new();
@@ -163,7 +168,7 @@ namespace AvantGarde.Views
             Debug.WriteLine($"ref selected: {selected?.Tag?.ToString() ?? "null"}");
 
             _treeView.ItemsSource = items;
-            SelectedItem = (PathItem?)selected?.Tag;
+            SelectedItem = current ?? (PathItem?)selected?.Tag;
             Debug.WriteLine($"Selected Now: {SelectedItem?.ToString() ?? "null"}");
         }
 
@@ -394,6 +399,14 @@ namespace AvantGarde.Views
                     info = project.MakeLocalName(project.AssemblyPath?.FullName);
                     icon = AssetModel.ProjectTree;
                 }
+            }
+
+            if (project.IsEvaluating)
+            {
+                // Say so, rather than briefly showing an answer derived from the project XML that
+                // the pending MSBuild evaluation is about to replace.
+                info = "Resolving project...";
+                icon = AssetModel.ProjectGreyTree;
             }
 
             var g0 = new Grid();
