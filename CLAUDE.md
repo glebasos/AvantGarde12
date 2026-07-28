@@ -27,11 +27,15 @@ previewer compatibility — that is Milestones 1 and 2.
 - **[AvantGarde/docs/milestone-4-result.md](AvantGarde/docs/milestone-4-result.md)** — fit-to-window,
   and the probe that proved PLAN.md's "host consumes the viewport messages" row **false**. Read
   before planning any viewport or input work.
+- **[AvantGarde/docs/milestone-4-input-result.md](AvantGarde/docs/milestone-4-input-result.md)** —
+  key, text and scroll forwarding: the same row proved **true** here, the guest-focus precondition
+  it hides, and two defects only measurement found (consuming a `KeyDown` destroys the text that
+  follows it; `PreviewControl`'s `x:Name` fields are all null).
 
 ## Where things stand
 
-**Milestones 0–3 are done, and Milestone 4 items 1 and 4.** App on Avalonia 12.1.0 / net10.0,
-0 warnings (Debug *and* Release), 69/69 tests. Milestone 3 was done ahead of Milestones 1–2 at the
+**Milestones 0–3 are done, and Milestone 4 items 1–4.** App on Avalonia 12.1.0 / net10.0,
+0 warnings (Debug *and* Release), 76/76 tests. Milestone 3 was done ahead of Milestones 1–2 at the
 user's direction.
 
 Dependency outcomes, which differ from what PLAN.md assumes:
@@ -62,8 +66,23 @@ Evaluation costs ~0.6 s per project, so it is worker-thread only: `BeginEvaluati
 thread marks projects and shows "Resolving project...", then `Evaluate()` runs on a worker, then
 `Refresh()` applies. `UpdateLoader` defers previewing while it is in flight.
 
-**Milestone 4 items 2, 3 and 5–8 are next** (key/text/scroll forwarding, then FPS limiting, build on
-demand, shadow copy, theme injection), with Milestone 5's internal debt taken opportunistically.
+**Milestone 4 items 5–8 are next** (FPS limiting, build on demand, shadow copy, theme injection),
+with Milestone 5's internal debt taken opportunistically. Item 5 has a concrete provocation now: a
+click into a guest `TextBox` leaves a caret blinking, which renders a frame about twice a second
+forever.
+
+**Input forwarding is in, and keyboard depends on the pointer.** The host routes key and text
+messages to whatever the *guest* has focused, and a guest that has never been clicked has focused
+nothing — measured, and there is no protocol message that would arm it any other way. Scroll needs
+no click, being hit-test routed. `Loading/InputMapper.cs` holds the shared, primitive-taking
+conversion to the protocol enums, which is what makes it unit-testable; `KeyboardEventMessage` and
+`PointerEventMessage` are thin wrappers over event args and are not.
+
+Two traps recorded in the milestone note and worth repeating: consuming a `KeyDown` suppresses the
+`TextInput` that would have followed it, so `Handled` is an allow-list of non-typing scroll keys;
+and `PreviewControl` calls `AvaloniaXamlLoader.Load(this)` rather than the generated
+`InitializeComponent()`, so **every `x:Name` field in it is null** — `GetCurrentPoint(null)` does not
+throw, it silently returns window-relative coordinates. Use the event's `sender`.
 
 **The host does not negotiate viewport size.** Measured, not inferred: it ignores
 `ClientViewportAllocatedMessage.Width/Height` and never answers `MeasureViewportMessage`. It renders

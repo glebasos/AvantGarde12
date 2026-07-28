@@ -328,12 +328,31 @@ public sealed class RemoteLoader : IDisposable
     public void SendPointerEvent(PointerEventMessage msg)
     {
         Debug.WriteLineIf(msg.IsPressOrReleased, $"{nameof(RemoteLoader)}.{nameof(SendPointerEvent)}");
-        var factory = v_factory;
 
-        if (factory != null && !factory.Load.Flags.HasFlag(LoadFlags.DisableEvents))
+        if (IsInputEnabled())
         {
-            Debug.WriteLineIf(msg.IsPressOrReleased, msg);
+            Debug.WriteLineIf(msg.IsPressOrReleased || msg.IsScrolled, msg);
             Send(v_connection, msg.ToMessage(Scale));
+        }
+    }
+
+    /// <summary>
+    /// Sends keyboard event information. It does nothing if events are disabled.
+    /// </summary>
+    /// <remarks>
+    /// The host delivers these to whatever the guest has focused, and a guest which has not been
+    /// clicked has focused nothing - see <see cref="KeyboardEventMessage"/>. Nothing here can detect
+    /// that, and there is no acknowledgement to detect it with, so a message sent to an unfocused
+    /// guest is silently discarded at the far end.
+    /// </remarks>
+    public void SendKeyboardEvent(KeyboardEventMessage msg)
+    {
+        Debug.WriteLine($"{nameof(RemoteLoader)}.{nameof(SendKeyboardEvent)}");
+
+        if (IsInputEnabled())
+        {
+            Debug.WriteLine(msg);
+            Send(v_connection, msg.ToMessage());
         }
     }
 
@@ -537,6 +556,16 @@ public sealed class RemoteLoader : IDisposable
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Returns true if user input should be forwarded to the guest. There is nothing to forward to
+    /// before the first preview, and the user can turn forwarding off outright.
+    /// </summary>
+    private bool IsInputEnabled()
+    {
+        var factory = v_factory;
+        return factory != null && !factory.Load.Flags.HasFlag(LoadFlags.DisableEvents);
     }
 
     private void AssertNotDisposed()

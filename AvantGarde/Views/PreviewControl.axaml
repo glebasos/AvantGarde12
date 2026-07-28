@@ -7,7 +7,10 @@
     xmlns:vm="using:AvantGarde.ViewModels"
     x:DataType="vm:PreviewControlViewModel"
 
-    x:Class="AvantGarde.Views.PreviewControl">
+    x:Class="AvantGarde.Views.PreviewControl"
+
+    Focusable="True"
+    FocusAdorner="{x:Null}">
 
     <Grid ColumnDefinitions="Auto Auto Auto" RowDefinitions="Auto Auto, Auto Auto">
 
@@ -57,6 +60,7 @@
                 PointerMoved="PreviewPointerMovedHandler"
                 PointerPressed="PreviewPointerPressedHandler"
                 PointerReleased="PreviewPointerReleasedHandler"
+                PointerWheelChanged="PreviewPointerWheelHandler"
             />
 
         </Grid>

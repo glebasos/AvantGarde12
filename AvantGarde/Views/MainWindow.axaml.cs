@@ -62,6 +62,7 @@ public partial class MainWindow : AvantWindow<MainWindowViewModel>
         PreviewPane.LoadFlagChecked += LoadFlagCheckedHandler;
         PreviewPane.RestartClicked += RestartHost;
         PreviewPane.PointerEventOccurred += PointerEventHandler;
+        PreviewPane.KeyboardEventOccurred += KeyboardEventHandler;
         PreviewPane.FitScaleChanged += FitScaleChangedHandler;
 
         _cache.Read();
@@ -508,6 +509,12 @@ public partial class MainWindow : AvantWindow<MainWindowViewModel>
     {
         Debug.WriteLineIf(e.IsPressOrReleased, $"{nameof(MainWindow)}.{nameof(PointerEventHandler)}");
         _loader.SendPointerEvent(e);
+    }
+
+    private void KeyboardEventHandler(KeyboardEventMessage e)
+    {
+        Debug.WriteLine($"{nameof(MainWindow)}.{nameof(KeyboardEventHandler)}");
+        _loader.SendKeyboardEvent(e);
     }
 
     private void SplitterDragHandler(object? sender, VectorEventArgs e)

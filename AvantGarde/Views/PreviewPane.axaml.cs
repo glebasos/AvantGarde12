@@ -60,6 +60,8 @@ public partial class PreviewPane : UserControl
 
         XamlCode.IsVisible = false;
         PreviewControl.PointerEventOccurred += PointerEventHandler;
+        PreviewControl.KeyboardEventOccurred += KeyboardEventHandler;
+        PreviewControl.WheelEventOccurred += WheelEventHandler;
         PreviewControl.GotoClick += GotoClickHander;
 
         _timer = new(TimeSpan.FromMilliseconds(100), DispatcherPriority.Normal, TimerHandler);
@@ -96,6 +98,11 @@ public partial class PreviewPane : UserControl
     /// Occurs when the user interacts with the preview.
     /// </summary>
     public Action<PointerEventMessage>? PointerEventOccurred;
+
+    /// <summary>
+    /// Occurs when the user types while the preview has focus.
+    /// </summary>
+    public Action<KeyboardEventMessage>? KeyboardEventOccurred;
 
     /// <summary>
     /// Gets or sets the preview window color.
@@ -405,6 +412,83 @@ public partial class PreviewPane : UserControl
         {
             PointerEventOccurred?.Invoke(e);
         }
+    }
+
+    /// <summary>
+    /// Forwards a keyboard message to the guest, returning whether it went. False leaves the key to
+    /// AvantGarde: with events disabled the preview must not swallow keys it is not passing on.
+    /// </summary>
+    private bool KeyboardEventHandler(KeyboardEventMessage e)
+    {
+        if (_model.IsDisableEventsChecked || KeyboardEventOccurred == null)
+        {
+            return false;
+        }
+
+        KeyboardEventOccurred.Invoke(e);
+        return true;
+    }
+
+    /// <summary>
+    /// Decides what a wheel turn over the preview bitmap means. There are three claims on the
+    /// gesture and they are settled in this order.
+    /// </summary>
+    /// <remarks>
+    /// Ctrl+Wheel is zoom, as it is nearly everywhere, and takes precedence.
+    ///
+    /// Otherwise the pane keeps the wheel while the preview is larger than the viewport on the axis
+    /// being scrolled, because panning a preview too big to see is what the wheel did before this
+    /// and taking that away would be a regression. Only when the pane has nothing to scroll does the
+    /// wheel go to the guest - which is the common case, fit-to-window among it.
+    ///
+    /// Testing the extent rather than the scroll offset is deliberate: a rule of "the pane first,
+    /// then the guest once the pane reaches its end" would hand the gesture over mid-drag, so the
+    /// same wheel turn would do different things depending on where the pane happened to be.
+    /// </remarks>
+    private void WheelEventHandler(PointerWheelEventArgs e, PointerEventMessage msg)
+    {
+        if (e.Handled)
+        {
+            return;
+        }
+
+        if (e.KeyModifiers.HasFlag(KeyModifiers.Control))
+        {
+            if (e.Delta.Y > 0)
+            {
+                _model.IncScale();
+            }
+            else
+            if (e.Delta.Y < 0)
+            {
+                _model.DecScale();
+            }
+
+            e.Handled = true;
+            return;
+        }
+
+        if (_model.IsDisableEventsChecked || CanPaneScroll(e.Delta))
+        {
+            return;
+        }
+
+        PointerEventOccurred?.Invoke(msg);
+        e.Handled = true;
+    }
+
+    /// <summary>
+    /// Returns true if the pane's own scroll viewer has somewhere to go on the axis the given wheel
+    /// delta acts upon.
+    /// </summary>
+    private bool CanPaneScroll(Vector delta)
+    {
+        if (Math.Abs(delta.X) > Math.Abs(delta.Y))
+        {
+            return PreviewScroll.Extent.Width > PreviewScroll.Viewport.Width;
+        }
+
+        return PreviewScroll.Extent.Height > PreviewScroll.Viewport.Height;
     }
 
     private void LoadFlagCheckedHandler(LoadFlags flags)
