@@ -52,6 +52,11 @@ public sealed class RemoteLoader : IDisposable
     // own stdout and stderr in the same buffer.
     private const string OutputPrefix = "[AvantGarde] ";
 
+    // Dips of slack allowed before a re-derived natural size is taken as a real change. See
+    // DeriveNaturalSize - it absorbs the rounding of a frame divided by a fractional DPI, nothing
+    // larger.
+    private const double NaturalSizeTolerance = 1.5;
+
     // Ordered by preference. See FindDesignerHost.
     private static readonly string[] HostFrameworkPreference = { "net8.0", "net10.0", "netstandard2.0" };
 
@@ -61,6 +66,15 @@ public sealed class RemoteLoader : IDisposable
 
     private readonly object _startSync = new();
     private readonly object _outputSync = new();
+
+    // Guards the scale and the latched natural size. Deliberately separate from _startSync, which
+    // UpdateThread holds across the whole of StartHostNoSync - a 10s process wait plus a 5s session
+    // wait. Scale used to live under _startSync, which was tolerable while only the scale dropdown
+    // touched it; fit-to-window moves it onto the resize path, where a 15s block would be a visible
+    // UI freeze. This lock is never held across blocking work, and is always the inner lock: code
+    // may take it while holding _startSync, never the reverse.
+    private readonly object _viewportSync = new();
+
     private readonly List<string> _output = new();
     private readonly HashSet<string> _reported = new();
 
@@ -75,7 +89,16 @@ public sealed class RemoteLoader : IDisposable
     private volatile bool v_sessionStarted;
     private volatile bool v_sessionMismatch;
 
+    // Set when XAML has been sent and no result or frame has come back for it yet. Scale pushes are
+    // withheld while it is set - see Scale.
+    private volatile bool v_xamlPending;
+    private volatile bool v_scalePending;
+
+    // All under _viewportSync.
     private double _scale = 1.0;
+    private double _naturalWidth = double.NaN;
+    private double _naturalHeight = double.NaN;
+    private bool _naturalLatched;
 
 
     /// <summary>
@@ -111,14 +134,14 @@ public sealed class RemoteLoader : IDisposable
     /// </summary>
     public double Scale
     {
-        get { lock (_startSync) { return _scale; } }
+        get { lock (_viewportSync) { return _scale; } }
 
         set
         {
             bool changed = false;
             value = Math.Max(value, 0.01);
 
-            lock (_startSync)
+            lock (_viewportSync)
             {
                 if (value != _scale)
                 {
@@ -129,7 +152,18 @@ public sealed class RemoteLoader : IDisposable
 
             if (changed)
             {
-                SendScale(v_connection, value);
+                if (v_xamlPending)
+                {
+                    // A XAML update is in flight. Pushing DPI now makes the host render the old
+                    // markup at the new scale and then the new markup immediately after, so the
+                    // push is deferred to whichever of the result or the frame lands first.
+                    Debug.WriteLine("Scale deferred - XAML update in flight");
+                    v_scalePending = true;
+                }
+                else
+                {
+                    SendScale(v_connection, value);
+                }
 
                 var factory = v_factory;
 
@@ -140,6 +174,16 @@ public sealed class RemoteLoader : IDisposable
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Gets the natural size of the previewed control in dips, i.e. the size the designer host
+    /// renders it at when the scale is 1.0. The value is NaN until a frame has arrived. See
+    /// <see cref="DeriveNaturalSize"/>.
+    /// </summary>
+    public Size NaturalSize
+    {
+        get { lock (_viewportSync) { return new Size(_naturalWidth, _naturalHeight); } }
     }
 
     /// <summary>
@@ -289,7 +333,7 @@ public sealed class RemoteLoader : IDisposable
         if (factory != null && !factory.Load.Flags.HasFlag(LoadFlags.DisableEvents))
         {
             Debug.WriteLineIf(msg.IsPressOrReleased, msg);
-            Send(v_connection, msg.ToMessage(_scale));
+            Send(v_connection, msg.ToMessage(Scale));
         }
     }
 
@@ -536,7 +580,7 @@ public sealed class RemoteLoader : IDisposable
                 {
                     // There will be no reply for this
                     v_factory = factory;
-                    InvokePreviewReady(CreateImmediatePreview(factory, _scale));
+                    InvokePreviewReady(CreateImmediatePreview(factory, Scale));
                 }
                 else
                 {
@@ -570,6 +614,16 @@ public sealed class RemoteLoader : IDisposable
         v_sessionId = null;
         v_sessionStarted = false;
         v_sessionMismatch = false;
+        v_xamlPending = false;
+        v_scalePending = false;
+
+        // The natural size belongs to the control the host had loaded. A new host will restate it.
+        lock (_viewportSync)
+        {
+            _naturalLatched = false;
+            _naturalWidth = double.NaN;
+            _naturalHeight = double.NaN;
+        }
 
         v_listener?.Dispose();
         v_listener = null;
@@ -691,7 +745,7 @@ public sealed class RemoteLoader : IDisposable
             Avalonia.Remote.Protocol.Viewport.PixelFormat.Rgba8888,
             Avalonia.Remote.Protocol.Viewport.PixelFormat.Rgb565];
 
-        if (!Send(cnx, fmt) || !SendScale(cnx, _scale))
+        if (!Send(cnx, fmt) || !SendScale(cnx, Scale))
         {
             throw new InvalidOperationException("Handshake failed to " + host.Name);
         }
@@ -824,7 +878,34 @@ public sealed class RemoteLoader : IDisposable
 
         Debug.WriteLine("AssemblyPath: " + msg.AssemblyPath);
         Debug.WriteLine("XamlFileProjectPath: " + msg.XamlFileProjectPath);
+
+        // A new generation of the markup, so the natural size is derived once more. See
+        // DeriveNaturalSize.
+        lock (_viewportSync)
+        {
+            _naturalLatched = false;
+        }
+
+        v_xamlPending = true;
         return Send(cnx, msg);
+    }
+
+    /// <summary>
+    /// Clears the in-flight XAML flag and pushes any scale that was withheld while it was set.
+    /// </summary>
+    private void ClearXamlPending()
+    {
+        if (v_xamlPending)
+        {
+            v_xamlPending = false;
+
+            if (v_scalePending)
+            {
+                v_scalePending = false;
+                Debug.WriteLine("Sending deferred scale");
+                SendScale(v_connection, Scale);
+            }
+        }
     }
 
     private bool Send(IAvaloniaRemoteTransportConnection? cnx, object msg)
@@ -943,9 +1024,7 @@ public sealed class RemoteLoader : IDisposable
             else
             if (msg is RequestViewportResizeMessage resize)
             {
-                // The host asks for a viewport size and gets no answer. Answering it is Milestone 4
-                // (viewport negotiation); until then say so rather than dropping it in silence.
-                ReportUnhandledOnce(msg, $"host asked for a {resize.Width} x {resize.Height} viewport");
+                HandleViewportResize(resize);
             }
             else
             {
@@ -961,6 +1040,8 @@ public sealed class RemoteLoader : IDisposable
     private void HandleFrame(IAvaloniaRemoteTransportConnection cnx, PreviewFactory? factory, FrameMessage frame)
     {
         Debug.WriteLine($"FRAME: {frame.SequenceId}, {frame.Width} x {frame.Height} px, {frame.Data.Length} bytes");
+        ClearXamlPending();
+        DeriveNaturalSize(frame);
         Debug.WriteLine($"factory null: {factory == null}");
         Debug.WriteLine($"IsImmediate: {factory?.IsImmediate == true}");
 
@@ -982,6 +1063,7 @@ public sealed class RemoteLoader : IDisposable
     private void HandleUpdateResult(PreviewFactory? factory, UpdateXamlResultMessage update)
     {
         Debug.WriteLine("UPDATE");
+        ClearXamlPending();
         Debug.WriteLine("Exception: " + update.Exception?.Message);
         Debug.WriteLine("Error: " + update.Error);
 
@@ -1029,6 +1111,94 @@ public sealed class RemoteLoader : IDisposable
 
             InvokePreviewReady(CreatePreview(factory, new PreviewError(error, line, pos)));
         }
+    }
+
+    /// <summary>
+    /// Records the natural size of the control from the host's viewport request.
+    /// </summary>
+    /// <remarks>
+    /// The message is the host stating the size it wants to render at, in scaled pixels. It is not
+    /// a request the client can refuse: probing the 12.0.5 host established that the Width and
+    /// Height of a ClientViewportAllocatedMessage sent in reply are ignored outright, both below
+    /// the design size and above the content's desired size. Only its DPI has any effect, and that
+    /// duplicates ClientRenderInfoMessage. So this is a notification, and the useful thing to do
+    /// with it is to learn the natural size - which fit-to-window needs and nothing else could
+    /// supply.
+    ///
+    /// Latched once per SendXaml, on purpose. The scale is derived from the natural size and the
+    /// host restates the size at every scale change, so recomputing on each message would feed the
+    /// output back into the input and let the scale walk. The natural size cannot change without
+    /// the XAML changing, so there is nothing to recompute.
+    /// </remarks>
+    private void HandleViewportResize(RequestViewportResizeMessage msg)
+    {
+        // Recorded, not answered, and not used to derive the natural size.
+        //
+        // Not answered because a reply cannot change anything: probing the 12.0.5 host established
+        // that the Width and Height of a ClientViewportAllocatedMessage are ignored outright, both
+        // below the design size and above the content's desired size. Only its DPI has any effect,
+        // and that duplicates ClientRenderInfoMessage, which is already wired.
+        //
+        // Not used to derive the natural size because the size stated here is in whatever DPI the
+        // host had applied when it sent the message, which is not knowable from this side. The
+        // first message after a XAML send arrives before a pending DPI change has been applied, so
+        // dividing by the scale in force at the send reports half the true size at 200%. See
+        // DeriveNaturalSize, which takes it from the frame instead - the frame states the DPI it
+        // was rendered at, so it is self-describing.
+        Debug.WriteLine($"Host requested viewport: {msg.Width} x {msg.Height}");
+    }
+
+    /// <summary>
+    /// Records the natural size of the control - the size it renders at when the scale is 1.0 -
+    /// from a frame, which carries both its pixel size and the DPI it was rendered at.
+    /// </summary>
+    /// <remarks>
+    /// Deriving it this way is what keeps fit-to-window from oscillating. The fit scale is computed
+    /// from the natural size and then pushed back to the host as DPI, so any derivation that does
+    /// not divide out the exact DPI of the frame feeds its own output back into its input. Pixel
+    /// size divided by the frame's own DPI is invariant under scale, so there is no loop to damp.
+    /// </remarks>
+    private void DeriveNaturalSize(FrameMessage frame)
+    {
+        var dpi = frame.DpiX > 0 && frame.DpiY > 0 ? new Vector(frame.DpiX, frame.DpiY) : Dpi;
+
+        // Rounded to whole dips. The host rounds the pixel size it renders, so at a fractional DPI
+        // the quotient lands a fraction of a dip off - a 525 px frame at 111.84 dpi gives 450.6.
+        var width = Math.Round(frame.Width * Dpi.X / dpi.X);
+        var height = Math.Round(frame.Height * Dpi.Y / dpi.Y);
+
+        if (!(width > 0) || !(height > 0))
+        {
+            return;
+        }
+
+        lock (_viewportSync)
+        {
+            if (_naturalLatched)
+            {
+                // One derivation per XAML generation. The control's size cannot change without the
+                // XAML changing, and re-deriving from later frames would take the value from a
+                // frame rendered at the fit scale - which is computed from this value.
+                return;
+            }
+
+            _naturalLatched = true;
+
+            // Rounding leaves a dip of slack, so an unchanged control can derive 450 from one frame
+            // and 451 from the next. Held steady across generations, because a natural size which
+            // flips by a dip on every re-send would nudge the fit scale with it.
+            if (Math.Abs(width - _naturalWidth) <= NaturalSizeTolerance &&
+                Math.Abs(height - _naturalHeight) <= NaturalSizeTolerance)
+            {
+                return;
+            }
+
+            _naturalWidth = width;
+            _naturalHeight = height;
+        }
+
+        Debug.WriteLine($"Natural size: {width} x {height} " +
+            $"(from {frame.Width} x {frame.Height} px at {dpi.X} x {dpi.Y} dpi)");
     }
 
     private void HandleSessionStart(StartDesignerSessionMessage msg)
@@ -1115,6 +1285,7 @@ public sealed class RemoteLoader : IDisposable
         var payload = factory.CreatePreview();
         payload.Source = bitamp;
         payload.Output = GetProcessOutput();
+        SetNaturalSize(payload);
         return payload;
     }
 
@@ -1123,7 +1294,17 @@ public sealed class RemoteLoader : IDisposable
         var payload = factory.CreatePreview();
         payload.Error = error;
         payload.Output = GetProcessOutput();
+        SetNaturalSize(payload);
         return payload;
+    }
+
+    private void SetNaturalSize(PreviewPayload payload)
+    {
+        lock (_viewportSync)
+        {
+            payload.NaturalWidth = _naturalWidth;
+            payload.NaturalHeight = _naturalHeight;
+        }
     }
 
     private PreviewPayload CreateImmediatePreview(PreviewFactory factory, double scale)

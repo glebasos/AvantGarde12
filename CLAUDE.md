@@ -24,11 +24,15 @@ previewer compatibility — that is Milestones 1 and 2.
 - **[AvantGarde/docs/milestone-3-result.md](AvantGarde/docs/milestone-3-result.md)** — what the
   Avalonia 12 migration actually changed, which predicted breakage never happened, and what is still
   unverified.
+- **[AvantGarde/docs/milestone-4-result.md](AvantGarde/docs/milestone-4-result.md)** — fit-to-window,
+  and the probe that proved PLAN.md's "host consumes the viewport messages" row **false**. Read
+  before planning any viewport or input work.
 
 ## Where things stand
 
-**Milestone 3 is done** — app on Avalonia 12.1.0 / net10.0, 0 warnings (Debug *and* Release), 48/48
-tests, launches and renders. Done ahead of Milestones 1–2 at the user's direction.
+**Milestones 0–3 are done, and Milestone 4 items 1 and 4.** App on Avalonia 12.1.0 / net10.0,
+0 warnings (Debug *and* Release), 69/69 tests. Milestone 3 was done ahead of Milestones 1–2 at the
+user's direction.
 
 Dependency outcomes, which differ from what PLAN.md assumes:
 
@@ -58,9 +62,20 @@ Evaluation costs ~0.6 s per project, so it is worker-thread only: `BeginEvaluati
 thread marks projects and shows "Resolving project...", then `Evaluate()` runs on a worker, then
 `Refresh()` applies. `UpdateLoader` defers previewing while it is in flight.
 
-**Milestone 2 is next**, but note it is not what blocks users — nothing observed in Milestone 0
-pointed at the protocol. Its strongest justification is real though: the host sends
-`RequestViewportResizeMessage` three times per preview and `MessageHandler` drops it silently.
+**Milestone 4 items 2, 3 and 5–8 are next** (key/text/scroll forwarding, then FPS limiting, build on
+demand, shadow copy, theme injection), with Milestone 5's internal debt taken opportunistically.
+
+**The host does not negotiate viewport size.** Measured, not inferred: it ignores
+`ClientViewportAllocatedMessage.Width/Height` and never answers `MeasureViewportMessage`. It renders
+at the design size — or the content's desired size where none is declared — and *states* that in
+`RequestViewportResizeMessage`. So fit-to-window is auto-scale via DPI, not reflow, and the control's
+natural size is derived from `FrameMessage`'s own pixel size and DPI (self-describing, so it cannot
+drift) rather than from the resize message. Don't try to reply to that message; there is nothing it
+would change.
+
+`RemoteLoader` now has a **third** lock, `_viewportSync`, guarding scale and natural size. `Scale`
+used to take `_startSync`, which `UpdateThread` holds across a ~15 s host start — tolerable for a
+dropdown, a UI freeze once resizing drives scale. `_viewportSync` is always the inner lock.
 
 The three Milestone 0 diagnostics in `RemoteLoader.cs` (explicit `--method avalonia-remote`; buffer
 all host output; capture output before `StopNoSync()`) are committed. Don't reimplement them — see
@@ -97,7 +112,7 @@ Everything before `808f084 v1.6.0` is upstream; the `wip` commits on top are thi
 
 ```
 dotnet build AvantGarde.sln          # must stay clean, zero new warnings
-dotnet test AvantGarde.Test          # 64 facts; still zero coverage of Loading/
+dotnet test AvantGarde.Test          # 69 facts; still zero coverage of Loading/
 ```
 
 Two Avalonia 12.0.5 fixtures, in **different** places — the second is not where PLAN.md says:
@@ -135,9 +150,12 @@ differential probe) — copy the `Exec` line from
   range operators, or expression-bodied members. Match the surrounding file.
 - `Nullable` and `ImplicitUsings` are enabled; compiled bindings are on by default. Tabs in `.csproj`.
 - `RemoteLoader` concurrency: `v_`-prefixed fields are `volatile`, **not** lock-guarded — they are
-  touched from the host's process callbacks and the TCP thread. Two separate locks exist,
-  `_startSync` (lifecycle, scale) and `_outputSync` (the output ring buffer, incl. `AppendOutput`).
-  Know which one applies before adding state; don't assume `v_` means "protected."
+  touched from the host's process callbacks and the TCP thread. **Three** separate locks exist:
+  `_startSync` (lifecycle), `_outputSync` (the output ring buffer, incl. `AppendOutput`), and
+  `_viewportSync` (scale and natural size). Know which one applies before adding state; don't assume
+  `v_` means "protected." `_viewportSync` is always the **inner** lock — take it while holding
+  `_startSync`, never the reverse — and it must never be held across blocking work, which is the
+  whole reason scale was moved out of `_startSync`.
 - Upstream comment style is sparse; the migration comments explaining *why* a non-obvious workaround
   exists (as in `RemoteLoader.ProcessOutputHandler`) are deliberate. Match that: explain the
   non-obvious, not the obvious.

@@ -81,6 +81,30 @@ public partial class PreviewControl : UserControl
     public double Scale { get; private set; } = 1.0;
 
     /// <summary>
+    /// Gets the size in dips of what the control draws around the preview bitmap - the window
+    /// top-bar above it and the dimension labels either side. Fit-to-window has to allow for it,
+    /// and it is measured rather than modelled because it varies with the payload: the top-bar is
+    /// there only for a window, the labels only when dimensions are shown, and the top-bar scales
+    /// with the zoom. The result is empty until a bitmap has been arranged.
+    /// </summary>
+    public Size ChromeSize
+    {
+        get
+        {
+            var image = _model.MainImage?.Size ?? default;
+            var bounds = Bounds.Size;
+
+            if (!(image.Width > 0) || !(image.Height > 0) ||
+                bounds.Width < image.Width || bounds.Height < image.Height)
+            {
+                return default;
+            }
+
+            return new Size(bounds.Width - image.Width, bounds.Height - image.Height);
+        }
+    }
+
+    /// <summary>
     /// Updates the preview at the given scale.
     /// </summary>
     public void Update(PreviewPayload? payload, double scale, bool showDimensions = true)
@@ -106,8 +130,8 @@ public partial class PreviewControl : UserControl
 
             if (showDimensions)
             {
-                _model.WidthText = payload.Width.ToString(true);
-                _model.HeightText = payload.Height.ToString(true);
+                _model.WidthText = GetDimensionText(payload.Width, payload.NaturalWidth);
+                _model.HeightText = GetDimensionText(payload.Height, payload.NaturalHeight);
             }
             else
             {
@@ -180,6 +204,29 @@ public partial class PreviewControl : UserControl
         }
 
         return Payload?.Source;
+    }
+
+    /// <summary>
+    /// Formats a dimension label, preferring the size the designer host actually rendered at over
+    /// the locally parsed d:DesignWidth/Height. The two agree where a design size is declared; where
+    /// one is not, the host's value is the only one there is and the declared value shows as NaN.
+    /// Any min/max from the markup is retained, as it still describes the control.
+    /// </summary>
+    private static string GetDimensionText(ControlDimension declared, double natural)
+    {
+        if (!double.IsFinite(natural) || natural <= 0)
+        {
+            return declared.ToString(true);
+        }
+
+        natural = Math.Round(natural);
+
+        if (declared.HasRange)
+        {
+            return new ControlDimension(natural, declared.Min, declared.Max).ToString(true);
+        }
+
+        return new ControlDimension(natural).ToString(true);
     }
 
     private void PreviewPointerMovedHandler(object? sender, PointerEventArgs e)

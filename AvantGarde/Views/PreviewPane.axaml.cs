@@ -17,6 +17,7 @@
 // -----------------------------------------------------------------------------
 
 using System.Diagnostics;
+using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Input.Platform;
@@ -34,9 +35,19 @@ namespace AvantGarde.Views;
 /// </summary>
 public partial class PreviewPane : UserControl
 {
+    // A drag fires SizeChanged per pixel. Recomputing the fit on each one would push a DPI change
+    // to the designer host at the same rate, so the pane settles first.
+    private static readonly TimeSpan FitInterval = TimeSpan.FromMilliseconds(150);
+
+    // Keeps the fitted preview clear of the scroll viewer's edges, and stops a factor which lands
+    // exactly on the bounds from summoning the scrollbars it was sized to avoid.
+    private const double FitInset = 8;
+
     private readonly DispatcherTimer _timer;
+    private readonly DispatcherTimer _fitTimer;
     private readonly PreviewPaneViewModel _model = new();
     private int _caretIndex = int.MinValue;
+    private Size _naturalSize;
 
     public PreviewPane()
     {
@@ -53,6 +64,8 @@ public partial class PreviewPane : UserControl
 
         _timer = new(TimeSpan.FromMilliseconds(100), DispatcherPriority.Normal, TimerHandler);
         _timer.Start();
+
+        _fitTimer = new(FitInterval, DispatcherPriority.Normal, FitTimerHandler);
 
         Update(null);
     }
@@ -71,6 +84,13 @@ public partial class PreviewPane : UserControl
     /// Occurs when scale is changed.
     /// </summary>
     public event Action<PreviewOptionsViewModel>? ScaleChanged;
+
+    /// <summary>
+    /// Occurs when the fit-to-window factor has been recomputed and <see cref="ScaleFactor"/> now
+    /// differs. Kept separate from <see cref="ScaleChanged"/>, which reports the user picking a
+    /// scale - routing this through it would re-enter the handler that asked for the fit.
+    /// </summary>
+    public event Action? FitScaleChanged;
 
     /// <summary>
     /// Occurs when the user interacts with the preview.
@@ -119,6 +139,43 @@ public partial class PreviewPane : UserControl
     public double ScaleFactor
     {
         get { return _model.ScaleFactor; }
+    }
+
+    /// <summary>
+    /// Gets whether the scale is fit-to-window.
+    /// </summary>
+    public bool IsFitToWindow
+    {
+        get { return _model.IsFitToWindow; }
+    }
+
+    /// <summary>
+    /// Recomputes the fit-to-window factor against the current pane size and the natural size last
+    /// stated by the designer host. The result is true if <see cref="ScaleFactor"/> changed. Does
+    /// nothing unless fit-to-window is selected and a natural size is known.
+    /// </summary>
+    public bool UpdateFitScale()
+    {
+        if (!_model.IsFitToWindow)
+        {
+            return false;
+        }
+
+        // The bitmap does not get the whole scroll viewer - the preview control draws a top-bar and
+        // dimension labels around it, and fitting to the bare bounds overflows by exactly that much.
+        var chrome = PreviewControl.ChromeSize;
+        var bounds = PreviewScroll.Bounds.Size;
+
+        var viewport = new Size(
+            Math.Max(bounds.Width - FitInset - chrome.Width, 0),
+            Math.Max(bounds.Height - FitInset - chrome.Height, 0));
+
+        var factor = PreviewOptionsViewModel.CalcFitScaleFactor(_naturalSize, viewport);
+
+        Debug.WriteLine($"{nameof(PreviewPane)}.{nameof(UpdateFitScale)}: " +
+            $"natural {_naturalSize}, bounds {bounds}, chrome {chrome}, viewport {viewport}, factor {factor}");
+
+        return _model.SetFitScaleFactor(factor);
     }
 
     /// <summary>
@@ -250,6 +307,26 @@ public partial class PreviewPane : UserControl
         Debug.WriteLine($"{nameof(PreviewPane)}.{nameof(Update)}");
         bool rslt = false;
 
+        // Deferred to the timer rather than computed here, because the fit needs
+        // PreviewControl.ChromeSize and that is only meaningful once the new bitmap has been
+        // arranged - which has not happened at this point.
+        //
+        // Rechecked on every frame, not only when the natural size changes, because the top-bar
+        // included in the chrome scales with the zoom: the first fit after a large zoom change is
+        // measured against the old top-bar and comes out conservative. The recheck converges in a
+        // step or two and then stops of its own accord, on SetFitScaleFactor's deadband - a fit
+        // which no longer moves pushes no scale, so no frame comes back to trigger another.
+        if (payload?.NaturalWidth > 0 && payload.NaturalHeight > 0)
+        {
+            _naturalSize = new Size(payload.NaturalWidth, payload.NaturalHeight);
+
+            if (_model.IsFitToWindow)
+            {
+                _fitTimer.Stop();
+                _fitTimer.Start();
+            }
+        }
+
         if (payload != null && !payload.IsProjectHeader)
         {
             Debug.WriteLine("Payload: " + payload.ItemKind);
@@ -336,6 +413,38 @@ public partial class PreviewPane : UserControl
     private void ScaleChangedHandler(PreviewOptionsViewModel sender)
     {
         ScaleChanged?.Invoke(sender);
+    }
+
+    private void PreviewScrollSizeChangedHandler(object? sender, SizeChangedEventArgs e)
+    {
+        if (_model.IsFitToWindow)
+        {
+            // Restart, so the fit is computed once the drag stops rather than at every step.
+            _fitTimer.Stop();
+            _fitTimer.Start();
+        }
+    }
+
+    private void FitTimerHandler(object? sender, EventArgs e)
+    {
+        _fitTimer.Stop();
+
+        if (UpdateFitScale())
+        {
+            InvokeFitScaleChanged();
+        }
+    }
+
+    private void InvokeFitScaleChanged()
+    {
+        try
+        {
+            FitScaleChanged?.Invoke();
+        }
+        catch (Exception e)
+        {
+            Debug.WriteLine(e);
+        }
     }
 
     private void GotoClickHander(PreviewError error)

@@ -186,6 +186,13 @@ verbatim and is exact.
 - **`MeasureViewportMessage` and `ClientViewportAllocatedMessage` are still never sent.** Answering
   `RequestViewportResizeMessage` is Milestone 4 item 1; this milestone only stops discarding it in
   silence.
+
+  **Superseded by [milestone-4-result.md](milestone-4-result.md), and the framing above was wrong.**
+  Neither message is sent because neither *can* be: the 12.0.5 host ignores
+  `ClientViewportAllocatedMessage.Width/Height` outright and never answers `MeasureViewportMessage`.
+  There is nothing to answer `RequestViewportResizeMessage` *with* — it is a notification, and
+  Milestone 4 consumes it rather than replying to it. The `ReportUnhandledOnce` branch for it is
+  gone.
 - **Two host starts per opened preview.** Visible in every trace here. It is the `BuildWatcher`
   first-poll-always-reports-a-change defect recorded in milestone-1, unchanged and still Milestone 5.
 - **`Dispose`'s empty `catch`, and the two in `InvokePreviewReady` / `InvokeOutputReceived`.**

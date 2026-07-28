@@ -62,6 +62,7 @@ public partial class MainWindow : AvantWindow<MainWindowViewModel>
         PreviewPane.LoadFlagChecked += LoadFlagCheckedHandler;
         PreviewPane.RestartClicked += RestartHost;
         PreviewPane.PointerEventOccurred += PointerEventHandler;
+        PreviewPane.FitScaleChanged += FitScaleChangedHandler;
 
         _cache.Read();
         _loader = new();
@@ -479,9 +480,28 @@ public partial class MainWindow : AvantWindow<MainWindowViewModel>
     private void ScaleChangedHandler(PreviewOptionsViewModel sender)
     {
         Debug.WriteLine($"{nameof(MainWindow)}.{nameof(ScaleChangedHandler)} = {sender.ScaleFactor}");
-        _loader.Scale = sender.ScaleFactor;
         PreviewPane.ScaleIndex = sender.ScaleSelectedIndex;
         Model.SetScaleIndex(sender.ScaleSelectedIndex, false);
+
+        if (sender.IsFitToWindow)
+        {
+            // Fit is not a rung of the ladder, so sender.ScaleFactor still holds the previous one.
+            // Only the pane knows the viewport, so it computes the factor and this reads it back.
+            PreviewPane.UpdateFitScale();
+            FitScaleChangedHandler();
+            return;
+        }
+
+        _loader.Scale = sender.ScaleFactor;
+    }
+
+    private void FitScaleChangedHandler()
+    {
+        var factor = PreviewPane.ScaleFactor;
+        Debug.WriteLine($"{nameof(MainWindow)}.{nameof(FitScaleChangedHandler)} = {factor}");
+
+        Model.SetFitScaleFactor(factor);
+        _loader.Scale = factor;
     }
 
     private void PointerEventHandler(PointerEventMessage e)
