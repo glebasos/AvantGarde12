@@ -303,6 +303,17 @@ public partial class MainWindow : AvantWindow<MainWindowViewModel>
                 if (item.Kind == PathKind.Solution)
                 {
                     OpenSolution(item.FullName, openExplorer);
+
+                    // -s/--select applies here too. It was previously honoured only when the
+                    // argument was a file within a project, which excluded the multi-project case
+                    // where the solution must be opened for a library item to resolve its app.
+                    var select = App.Arguments["s"] ?? App.Arguments["select"];
+
+                    if (!string.IsNullOrEmpty(select))
+                    {
+                        ExplorerPane.TrySelect(select);
+                    }
+
                     return;
                 }
 

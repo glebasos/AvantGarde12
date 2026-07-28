@@ -97,11 +97,18 @@ namespace AvantGarde.Views
             {
                 var old = _treeView.SelectedItem as TreeViewItem;
                 var sel = value?.Tag as TreeViewItem;
+
+                // Containment must be tested at any depth. _treeView.Items holds only the project
+                // nodes, so a flat Contains() rejected every file item and silently ignored the
+                // assignment - which is how the -s command line option, and restoring a selection
+                // across a tree rebuild, both failed for anything below the top level.
+                bool contains = sel != null && ContainsItem(_treeView.Items, sel);
+
                 Debug.WriteLine($"Set SelectedItem new: {sel?.ToString() ?? "null"}, {value?.ToString() ?? "null"}");
                 Debug.WriteLine($"Set SelectedItem old: {old?.ToString() ?? "null"}, {old?.Tag?.ToString() ?? "null"}");
-                Debug.WriteLine($"Contains: {_treeView.Items.Contains(sel)}");
+                Debug.WriteLine($"Contains: {contains}");
 
-                if (_treeView.SelectedItem != sel && (sel == null || _treeView.Items.Contains(sel)))
+                if (_treeView.SelectedItem != sel && (sel == null || contains))
                 {
                     Debug.WriteLine("Set confirmed");
                     _treeView.SelectedItem = value?.Tag;
@@ -173,6 +180,24 @@ namespace AvantGarde.Views
                 // Leave top level selected
                 _treeView.SelectedItem = node.Project?.Tag;
             }
+        }
+
+        private static bool ContainsItem(IEnumerable? items, TreeViewItem view)
+        {
+            if (items != null)
+            {
+                foreach (var item in items)
+                {
+                    var temp = (TreeViewItem)item;
+
+                    if (temp == view || ContainsItem(temp.Items, view))
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
         }
 
         private static void Collapse(IEnumerable? items)

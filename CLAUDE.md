@@ -37,20 +37,25 @@ Dependency outcomes, which differ from what PLAN.md assumes:
 Lesson from the first two: when an Avalonia-adjacent package looks absent on 12, check for a rename
 before concluding it was discontinued.
 
-**Milestone 0 is partly done.** The differential probe (host launched by hand against a minimal
-Avalonia 12 app) is complete and classified: the practical break is **version resolution** —
-`FindDesignerHost` exact-matches `<nugetRoot>/avalonia/<version>`, and the fixture's 12.0.5 is not in
-the cache until restored. Secondarily, a `net10.0` designer host against a `net8.0` app dies on
-`System.Runtime`, which surfaces in-app as an undiagnosable 10 s timeout. Both point at **Milestone 1**
-(MSBuild-driven discovery), which is the next step.
+**Milestone 0 is done** — differential probe *and* in-app round trip, both written up in the
+milestone-0 note. Headline: a restored, built `AvaloniaMvvm` **previews correctly today**, frames and
+all, on the 12.1.0 build. Every failure observed is **discovery**, never protocol, so **Milestone 1
+is next** and Milestone 2 is not what blocks users. Three discovery failures are on record:
 
-Still outstanding from Milestone 0: the in-app round-trip — AvantGarde opening
-`AvaloniaMvvm/Views/MainWindow.axaml`, then `MultiProjectSolution` for the two-assembly path. Cheapest
-next action, and only diagnosable *because* of the uncommitted `RemoteLoader.cs` changes below.
+1. version resolution — `FindDesignerHost` exact-matches `<nugetRoot>/avalonia/<version>`, absent
+   until the user's project is restored;
+2. `TargetFramework` declared in `Directory.Build.props` is invisible to the csproj XML parse, so
+   *every* project in `MultiProjectSolution` reports "assembly not found" while fully built — this is
+   Milestone 1's acceptance test;
+3. host TFM selection — a `net10.0` host against a `net8.0` app dies on `System.Runtime`. Measured:
+   AvantGarde does pick `net8.0` today, by traversal-order accident. Latent, not live.
 
-Three Milestone 0 changes are **applied and uncommitted** in `AvantGarde/Loading/RemoteLoader.cs`
-(explicit `--method avalonia-remote`; buffer all host output; capture output before `StopNoSync()`).
-Don't reimplement them — see the milestone-0 note for why each exists.
+The two-assembly path and the whole protocol round trip are **verified working on 12.0.5** once
+discovery is unblocked. Don't re-verify them; don't rebuild them.
+
+The three Milestone 0 diagnostics in `RemoteLoader.cs` (explicit `--method avalonia-remote`; buffer
+all host output; capture output before `StopNoSync()`) are committed. Don't reimplement them — see
+the milestone-0 note for why each exists.
 
 Everything before `808f084 v1.6.0` is upstream; the `wip` commits on top are this work.
 
@@ -86,15 +91,28 @@ dotnet build AvantGarde.sln          # must stay clean, zero new warnings
 dotnet test AvantGarde.Test          # ~35 facts; zero coverage of Loading/ today
 ```
 
-Test fixtures are the real Avalonia 12.0.5 solutions in AvaloniaRider's test data —
-**`E:\Projects\dotnet\AvaloniaPreviewer\AvaloniaRider\testData\solutions\`**:
+Two Avalonia 12.0.5 fixtures, in **different** places — the second is not where PLAN.md says:
 
-- `AvaloniaMvvm` — single project; `Views/MainWindow.axaml` is the smoke test.
-- `MultiProjectSolution` — has `ClassLibrary1` + `AvaloniaApp1`, exercises the two-assembly path.
+- `AvaloniaRider\testData\solutions\AvaloniaMvvm` — single project; `Views/MainWindow.axaml` is the
+  smoke test. Used in place.
+- **`E:\Projects\dotnet\AvaloniaPreviewer\fixtures\MultiProjectSolution`** — a working copy, because
+  AvaloniaRider's original **does not compile** (missing `partial`, `LogToDebug()`,
+  `Avalonia.Themes.Default`). `ClassLibrary1` + `AvaloniaApp1` exercise the two-assembly path.
+  Its `TargetFramework` lives in `Directory.Build.props` **on purpose** — that is Milestone 1's
+  acceptance test. Don't "fix" it by inlining the property.
 
 **Restore and build a fixture before pointing AvantGarde at it.** `AvaloniaMvvm` ships without
 `obj/`, so NuGet's `.g.props` is not imported and `AvaloniaPreviewerNetCoreToolPath` evaluates empty
 — that is the exact unrestored-project case Milestone 1 must report actionably.
+
+Driving the app without clicking (this is how Milestone 0 part 2 was done — see that note):
+
+- Launch the **Debug** build with stdout redirected: `Debug.WriteLine` goes to stdout, giving the
+  full internal trace (discovery steps, every protocol message type, frame sizes).
+- `AvantGarde.exe <sln|csproj|file> -s=<leaf name>` opens and selects, no UI interaction.
+- Screenshot with `PrintWindow` + `PW_RENDERFULLCONTENT` (flag `2`); `CopyFromScreen` returns black.
+- `Get-CimInstance Win32_Process | ? CommandLine -like '*Designer.HostApp*'` shows which designer
+  host TFM was actually launched.
 
 To isolate a failure from AvantGarde entirely, launch the designer host by hand (the plan's
 differential probe) — copy the `Exec` line from
