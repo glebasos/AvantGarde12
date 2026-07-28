@@ -42,6 +42,16 @@ public sealed class RemoteLoader : IDisposable
     private static readonly Vector Dpi = new(96, 96);
     private const string DotnetHostName = "Avalonia.Designer.HostApp.dll";
 
+    // Milliseconds to wait for StartDesignerSessionMessage after the host connects. Measured, the
+    // message arrives within a few milliseconds of the accept, so this is generous. It is separate
+    // from Timeout because that governs process start, and a host which connects but never
+    // announces should not stall a preview for the full process-start allowance.
+    private const int SessionTimeout = 5000;
+
+    // Prefixes output lines written by AvantGarde itself, so they can be told apart from the host's
+    // own stdout and stderr in the same buffer.
+    private const string OutputPrefix = "[AvantGarde] ";
+
     // Ordered by preference. See FindDesignerHost.
     private static readonly string[] HostFrameworkPreference = { "net8.0", "net10.0", "netstandard2.0" };
 
@@ -52,6 +62,7 @@ public sealed class RemoteLoader : IDisposable
     private readonly object _startSync = new();
     private readonly object _outputSync = new();
     private readonly List<string> _output = new();
+    private readonly HashSet<string> _reported = new();
 
     private volatile bool v_disposed;
     private volatile int v_timeout = 10000;
@@ -60,6 +71,9 @@ public sealed class RemoteLoader : IDisposable
     private volatile IAvaloniaRemoteTransportConnection? v_connection;
     private volatile PreviewFactory? v_factory = null;
     private volatile int v_maxOutputLines = 100;
+    private volatile string? v_sessionId;
+    private volatile bool v_sessionStarted;
+    private volatile bool v_sessionMismatch;
 
     private double _scale = 1.0;
 
@@ -526,7 +540,7 @@ public sealed class RemoteLoader : IDisposable
                 }
                 else
                 {
-                    SendXaml(v_connection, factory, true);
+                    SendXaml(v_connection, factory);
                     v_factory = factory;
                 }
             }
@@ -550,6 +564,13 @@ public sealed class RemoteLoader : IDisposable
     private void StopNoSync()
     {
         v_factory = null;
+
+        // Every host gets its own session. Left set, these would let the next host pass its gate on
+        // the previous one's announcement - and a rebuild restarts the host, so that is routine.
+        v_sessionId = null;
+        v_sessionStarted = false;
+        v_sessionMismatch = false;
+
         v_listener?.Dispose();
         v_listener = null;
 
@@ -598,6 +619,14 @@ public sealed class RemoteLoader : IDisposable
         var host = ResolveDesignerHost(load);
         Debug.WriteLine("Host: " + host.FullName);
 
+        // Identifies this host instance. The value is echoed back verbatim in
+        // StartDesignerSessionMessage (measured against 12.0.5), so a host left over from an
+        // earlier run which reaches a recycled port can be told apart from the one just started.
+        var session = Guid.NewGuid().ToString();
+        v_sessionId = session;
+        v_sessionStarted = false;
+        v_sessionMismatch = false;
+
         // Binds the listener as well, because the port number has to go into the host command line.
         var port = StartListenerNoSync();
 
@@ -613,7 +642,7 @@ public sealed class RemoteLoader : IDisposable
         // --method is passed explicitly rather than relying on the host default. The host supports
         // 'avalonia-remote', 'win32' and 'html'; if the default ever changes we would silently
         // receive HtmlTransportStartedMessage and never a frame.
-        var args = $@"exec --runtimeconfig ""{load.AppConfigPath}"" --depsfile ""{load.AppDepsPath}"" ""{host}"" --transport tcp-bson://127.0.0.1:{port}/ --method avalonia-remote ""{load.AppAssembly}""";
+        var args = $@"exec --runtimeconfig ""{load.AppConfigPath}"" --depsfile ""{load.AppDepsPath}"" ""{host}"" --transport tcp-bson://127.0.0.1:{port}/ --method avalonia-remote --session-id ""{session}"" ""{load.AppAssembly}""";
 
         Debug.WriteLine($"STARTING: {dotnet} {args}");
 
@@ -650,9 +679,12 @@ public sealed class RemoteLoader : IDisposable
         }
 
         Debug.WriteLine("Connection received");
+
+        // Handlers are attached in the listener callback, before v_connection is assigned, so
+        // nothing arriving between the accept and here can be dropped. That matters now the first
+        // XAML update waits on StartDesignerSessionMessage - losing it would stall every preview
+        // for SessionTimeout rather than merely going unnoticed.
         var cnx = v_connection ?? throw new InvalidOperationException($"{nameof(v_connection)} is null");
-        cnx.OnException += ErrorHandler;
-        cnx.OnMessage += MessageHandler;
 
         var fmt = new ClientSupportedPixelFormatsMessage();
         fmt.Formats = [ Avalonia.Remote.Protocol.Viewport.PixelFormat.Bgra8888,
@@ -664,7 +696,39 @@ public sealed class RemoteLoader : IDisposable
             throw new InvalidOperationException("Handshake failed to " + host.Name);
         }
 
+        WaitForSessionNoSync(host);
         Debug.WriteLine("Connection OK");
+    }
+
+    /// <summary>
+    /// Blocks until the host announces its designer session, so that the first UpdateXamlMessage
+    /// follows it rather than racing ahead of it. The pixel format and DPI handshake above is left
+    /// where it is - it is sent on accept and demonstrably works, and only the XAML update needs
+    /// the session.
+    /// </summary>
+    private void WaitForSessionNoSync(PathItem host)
+    {
+        SpinWait.SpinUntil(() =>
+            { return v_sessionStarted || v_sessionMismatch || v_disposed || !IsRunning; }, SessionTimeout);
+
+        if (v_sessionMismatch)
+        {
+            throw new InvalidOperationException(
+                $"A designer session belonging to another instance answered on the port used for {host.Name}");
+        }
+
+        if (!v_sessionStarted && !v_disposed)
+        {
+            if (!IsRunning)
+            {
+                throw new InvalidOperationException($"{host.Name} exited before starting a designer session");
+            }
+
+            // Fallback. A host which never announces still gets its XAML, because refusing to
+            // preview would be a worse failure than sending early - which is what we did before.
+            AppendAppOutput($"Warning: {host.Name} did not start a designer session within " +
+                $"{SessionTimeout}ms - sending XAML anyway");
+        }
     }
 
     /// <summary>
@@ -682,7 +746,16 @@ public sealed class RemoteLoader : IDisposable
 
             try
             {
-                v_listener = new BsonTcpTransport().Listen(IPAddress.Loopback, port, c => { v_connection = c; });
+                // Subscribe before publishing the connection. StartHostNoSync spins until
+                // v_connection is set, so anything attached after that could miss a message the
+                // host sent immediately on connecting - StartDesignerSessionMessage among them.
+                v_listener = new BsonTcpTransport().Listen(IPAddress.Loopback, port, c =>
+                    {
+                        c.OnException += ErrorHandler;
+                        c.OnMessage += MessageHandler;
+                        v_connection = c;
+                    });
+
                 return port;
             }
             catch (SocketException e)
@@ -731,13 +804,13 @@ public sealed class RemoteLoader : IDisposable
         return Send(cnx, msg);
     }
 
-    private bool SendXaml(IAvaloniaRemoteTransportConnection? cnx, PreviewFactory factory, bool processed)
+    private bool SendXaml(IAvaloniaRemoteTransportConnection? cnx, PreviewFactory factory)
     {
         Debug.WriteLine($"{nameof(RemoteLoader)}.{nameof(SendXaml)}");
         var msg = new UpdateXamlMessage();
         msg.AssemblyPath = factory.Load.ProjectAssembly;
 
-        msg.Xaml = factory.GetXaml(processed) ??
+        msg.Xaml = factory.GetXaml() ??
             throw new ArgumentNullException(nameof(msg.Xaml));
 
         // Needs to be rooted against project directory
@@ -801,7 +874,19 @@ public sealed class RemoteLoader : IDisposable
         lock (_outputSync)
         {
             _output.Clear();
+            _reported.Clear();
         }
+    }
+
+    /// <summary>
+    /// Writes a line of AvantGarde's own to the host output buffer and notifies the UI. Unlike
+    /// host output this is not gated on there being a factory, because the things worth saying
+    /// here happen while the host is still starting.
+    /// </summary>
+    private void AppendAppOutput(string msg)
+    {
+        Debug.WriteLine(msg);
+        InvokeOutputReceived(AppendOutput(OutputPrefix + msg));
     }
 
     private string? AppendOutput(string? msg)
@@ -838,73 +923,171 @@ public sealed class RemoteLoader : IDisposable
 
             if (msg is FrameMessage frame)
             {
-                Debug.WriteLine($"FRAME: {frame.SequenceId}, {frame.Width} x {frame.Height} px, {frame.Data.Length} bytes");
-                Debug.WriteLine($"factory null: {factory == null}");
-                Debug.WriteLine($"IsImmediate: {factory?.IsImmediate == true}");
-
-                if (factory?.IsImmediate == false)
-                {
-                    var bmp = ToBitmap(frame);
-
-                    if (bmp != null)
-                    {
-                        InvokePreviewReady(CreatePreview(factory, bmp));
-                    }
-                }
-
-                var resp = new FrameReceivedMessage();
-                resp.SequenceId = frame.SequenceId;
-                Send(cnx, resp);
+                HandleFrame(cnx, factory, frame);
             }
             else
             if (msg is UpdateXamlResultMessage update)
             {
-                Debug.WriteLine("UPDATE");
-                Debug.WriteLine("Exception: " + update.Exception?.Message);
-                Debug.WriteLine("Error: " + update.Error);
-
-                if (factory != null)
-                {
-                    var error = update.Error;
-                    int line = 0;
-                    int pos = 0;
-
-                    if (!string.IsNullOrWhiteSpace(update.Exception?.Message))
-                    {
-                        Debug.WriteLine("Line number: " + update.Exception.LineNumber);
-                        Debug.WriteLine("Line Position: " + update.Exception.LinePosition);
-                        error = update.Exception.Message;
-
-                        if (update.Exception.LineNumber.HasValue)
-                        {
-                            line = update.Exception.LineNumber.Value;
-
-                            if (update.Exception.LinePosition.HasValue)
-                            {
-                                pos = update.Exception.LinePosition.Value;
-                            }
-                        }
-                    }
-
-                    if (!string.IsNullOrWhiteSpace(error))
-                    {
-                        if (factory.GetResendAndReset())
-                        {
-                            Debug.WriteLine("Resend");
-                            SendXaml(cnx, factory, false);
-                        }
-                        else
-                        {
-                            Debug.WriteLine("Failed");
-                            InvokePreviewReady(CreatePreview(factory, new PreviewError(error, line, pos)));
-                        }
-                    }
-                }
+                HandleUpdateResult(factory, update);
+            }
+            else
+            if (msg is StartDesignerSessionMessage session)
+            {
+                HandleSessionStart(session);
+            }
+            else
+            if (msg is HtmlTransportStartedMessage html)
+            {
+                HandleHtmlTransport(factory, html);
+            }
+            else
+            if (msg is RequestViewportResizeMessage resize)
+            {
+                // The host asks for a viewport size and gets no answer. Answering it is Milestone 4
+                // (viewport negotiation); until then say so rather than dropping it in silence.
+                ReportUnhandledOnce(msg, $"host asked for a {resize.Width} x {resize.Height} viewport");
+            }
+            else
+            {
+                ReportUnhandledOnce(msg, null);
             }
         }
         catch (Exception e)
         {
             Debug.WriteLine("EXCEPTION IN MESSAGE HANDLER: " + e);
+        }
+    }
+
+    private void HandleFrame(IAvaloniaRemoteTransportConnection cnx, PreviewFactory? factory, FrameMessage frame)
+    {
+        Debug.WriteLine($"FRAME: {frame.SequenceId}, {frame.Width} x {frame.Height} px, {frame.Data.Length} bytes");
+        Debug.WriteLine($"factory null: {factory == null}");
+        Debug.WriteLine($"IsImmediate: {factory?.IsImmediate == true}");
+
+        if (factory?.IsImmediate == false)
+        {
+            var bmp = ToBitmap(frame);
+
+            if (bmp != null)
+            {
+                InvokePreviewReady(CreatePreview(factory, bmp));
+            }
+        }
+
+        var resp = new FrameReceivedMessage();
+        resp.SequenceId = frame.SequenceId;
+        Send(cnx, resp);
+    }
+
+    private void HandleUpdateResult(PreviewFactory? factory, UpdateXamlResultMessage update)
+    {
+        Debug.WriteLine("UPDATE");
+        Debug.WriteLine("Exception: " + update.Exception?.Message);
+        Debug.WriteLine("Error: " + update.Error);
+
+        if (factory == null)
+        {
+            return;
+        }
+
+        var error = update.Error;
+        int line = 0;
+        int pos = 0;
+
+        if (!string.IsNullOrWhiteSpace(update.Exception?.Message))
+        {
+            Debug.WriteLine("Line number: " + update.Exception.LineNumber);
+            Debug.WriteLine("Line Position: " + update.Exception.LinePosition);
+            error = update.Exception.Message;
+
+            if (update.Exception.LineNumber.HasValue)
+            {
+                line = update.Exception.LineNumber.Value;
+
+                if (update.Exception.LinePosition.HasValue)
+                {
+                    pos = update.Exception.LinePosition.Value;
+                }
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(error))
+        {
+            Debug.WriteLine("Failed");
+
+            if (factory.ProcessedXaml != null)
+            {
+                // The markup sent was not the file on disk - grid lines, event stripping and asset
+                // prefetching all rewrite it - so the error may be ours rather than the user's.
+                // Say which options were applied. This replaces a silent one-shot resend of the
+                // verbatim file, which could go on to show a preview of markup the user never
+                // configured, with no indication that it had happened.
+                AppendAppOutput($"The XAML sent was modified by preview options ({factory.Load.Flags}) - " +
+                    "turn them off to rule the modification out. The reported line is a line of the " +
+                    "modified markup and may not be the line of the file");
+            }
+
+            InvokePreviewReady(CreatePreview(factory, new PreviewError(error, line, pos)));
+        }
+    }
+
+    private void HandleSessionStart(StartDesignerSessionMessage msg)
+    {
+        Debug.WriteLine("SessionId: " + msg.SessionId);
+        var expect = v_sessionId;
+
+        if (!string.IsNullOrEmpty(expect) && msg.SessionId != expect)
+        {
+            // The id went out on the host command line and comes back verbatim, so a mismatch
+            // positively identifies a host from an earlier run which has reached a recycled port.
+            AppendAppOutput($"Ignoring a designer session belonging to another instance " +
+                $"(expected {expect}, received {msg.SessionId})");
+
+            v_sessionMismatch = true;
+            return;
+        }
+
+        v_sessionStarted = true;
+    }
+
+    private void HandleHtmlTransport(PreviewFactory? factory, HtmlTransportStartedMessage msg)
+    {
+        // Terminal, and worth more than an output line. The host was told --method avalonia-remote,
+        // so reaching here means it is rendering to HTTP instead and no frame will ever arrive on
+        // this connection. Without this the symptom is an indefinitely blank preview.
+        var text = $"The designer host started an HTML transport on {msg.Uri} and will send no preview frames";
+        AppendAppOutput(text);
+
+        if (factory != null)
+        {
+            InvokePreviewReady(CreatePreview(factory, new PreviewError(text)));
+        }
+    }
+
+    /// <summary>
+    /// Reports a message type the client does not act on, once per host process. The host repeats
+    /// several of these per preview, so reporting every occurrence would bury the output pane.
+    /// </summary>
+    private void ReportUnhandledOnce(object msg, string? detail)
+    {
+        var name = msg.GetType().Name;
+        bool report;
+
+        lock (_outputSync)
+        {
+            report = _reported.Add(name);
+        }
+
+        if (report)
+        {
+            var text = $"Message not handled: {name}";
+
+            if (!string.IsNullOrEmpty(detail))
+            {
+                text += " - " + detail;
+            }
+
+            AppendAppOutput(text + " (further occurrences are not reported)");
         }
     }
 

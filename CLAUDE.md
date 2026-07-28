@@ -18,6 +18,9 @@ previewer compatibility — that is Milestones 1 and 2.
 - **[AvantGarde/docs/milestone-1-result.md](AvantGarde/docs/milestone-1-result.md)** — the MSBuild
   discovery spine as built, with three probe findings (notably: the MSBuild `AvaloniaVersion`
   property is a trap) and the list of known-and-deliberately-unfixed issues.
+- **[AvantGarde/docs/milestone-2-result.md](AvantGarde/docs/milestone-2-result.md)** — protocol
+  correctness as built, the two host probes that decided its design, and the error-line-number
+  regression that deleting the verbatim resend exposed.
 - **[AvantGarde/docs/milestone-3-result.md](AvantGarde/docs/milestone-3-result.md)** — what the
   Avalonia 12 migration actually changed, which predicted breakage never happened, and what is still
   unverified.
