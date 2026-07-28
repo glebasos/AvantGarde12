@@ -100,10 +100,17 @@ Two further guards, both from measured drift rather than theory:
 - **Clamped to 400 %** (`MaxFitScale`). Verified against a control with no design size: natural
   91 × 19 in a 932 × 598 pane computes 10.24 and is held at 4.0.
 - **Resize is debounced 150 ms.** `SizeChanged` fires per pixel during a drag; without this each
-  pixel would push a DPI change to the host.
+  pixel would push a DPI change to the host. The frame path *starts* the timer rather than
+  restarting it, because frames can arrive faster than the interval — animated content does — and
+  restarting on each would hold it off its tick indefinitely.
+- **`IncScale` leaves fit onto the first rung above the settled factor**, not index + 1. `+` from a
+  fit of 1.06 would otherwise land on 25 % and shrink the preview, on a button marked "increase".
+  `DecScale` correspondingly stops at 25 % rather than stepping into fit.
 - **The in-flight interlock is implemented**, per the plan: a scale change while a XAML update is
   outstanding sets `v_scalePending` instead of sending, and is flushed by whichever of the result or
-  the first frame arrives.
+  the first frame arrives. `v_xamlPending` is cleared again if the send itself fails — left set on a
+  send that never happened, every later scale change would be deferred against a reply that cannot
+  arrive.
 
 ### The chrome correction
 
@@ -157,6 +164,25 @@ redirected, `-s=<leaf>`), plus `PrintWindow` screenshots.
    clipped and both dimension labels visible.
 8. `RequestViewportResizeMessage` no longer reaches `ReportUnhandledOnce`; the OUTPUT pane no longer
    carries `Message not handled: RequestViewportResizeMessage`.
+9. **PLAN.md verification item 8 — the actual resize gesture**, driven through the OS with
+   `MoveWindow` rather than by entering fit at a fixed size. The guest re-renders at each new
+   viewport, and this is the run that exercises `PreviewScrollSizeChangedHandler`, the debounce and
+   the relocated lock:
+
+   | Scroll viewer bounds | Factor | Frame |
+   |---|---|---|
+   | 967 × 606 | 1.06375 | 851 × 479 |
+   | 680 × 585 | 0.705 | 564 × 318 |
+   | 960 × 685 | 1.055 | 844 × 475 |
+   | 860 × 645 | 0.93 | 744 × 419 |
+
+   Every fit is followed by a recheck returning the *same* factor and stopping — the deadband
+   terminating the convergence, in the real gesture rather than in theory.
+10. **The debounce coalesces.** A sweep of ten `MoveWindow` calls 25 ms apart produced **one**
+    `UpdateFitScale` and **one** `Send scale`, at the final size — not ten.
+11. **Both interlock branches fired**, in the same run: `Scale deferred - XAML update in flight`
+    followed by `Sending deferred scale`, when the fit landed while the first XAML update was still
+    outstanding.
 
 All probe code was reverted, and the temporary `ProbeNoSize.axaml` deleted from the fixture — a
 stray `.axaml` under an Avalonia project would be globbed on the next fixture rebuild.

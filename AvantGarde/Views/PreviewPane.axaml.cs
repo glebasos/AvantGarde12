@@ -320,9 +320,11 @@ public partial class PreviewPane : UserControl
         {
             _naturalSize = new Size(payload.NaturalWidth, payload.NaturalHeight);
 
-            if (_model.IsFitToWindow)
+            // Started rather than restarted. Frames can arrive faster than the interval - animated
+            // content does - and restarting on each would hold the timer off its tick forever, so
+            // the fit would never be recomputed at all.
+            if (_model.IsFitToWindow && !_fitTimer.IsEnabled)
             {
-                _fitTimer.Stop();
                 _fitTimer.Start();
             }
         }

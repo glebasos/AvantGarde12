@@ -886,8 +886,18 @@ public sealed class RemoteLoader : IDisposable
             _naturalLatched = false;
         }
 
+        // Cleared again if the send fails. Left set on a send that never happened, every later
+        // scale change would be deferred against a reply that cannot arrive, because nothing else
+        // clears the flag until the host is restarted.
         v_xamlPending = true;
-        return Send(cnx, msg);
+
+        if (!Send(cnx, msg))
+        {
+            v_xamlPending = false;
+            return false;
+        }
+
+        return true;
     }
 
     /// <summary>

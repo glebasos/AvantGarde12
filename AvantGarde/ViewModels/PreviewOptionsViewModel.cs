@@ -381,7 +381,10 @@ namespace AvantGarde.ViewModels
 
         public void IncScale(bool invoke)
         {
-            int idx = _scaleSelectedIndex + 1;
+            // Stepping up out of fit must not land on 25%, which is what index+1 would give and
+            // would shrink the preview on a button marked "increase". Lands on the first rung above
+            // the factor the fit had settled at instead.
+            int idx = IsFitToWindow ? GetRungAbove(ScaleFactor) : _scaleSelectedIndex + 1;
 
             if (idx < _scaleItems.Count)
             {
@@ -439,6 +442,32 @@ namespace AvantGarde.ViewModels
             }
         }
 
+        /// <summary>
+        /// Returns the index of the lowest rung whose factor exceeds the given value, or the top
+        /// rung if none does. Never returns <see cref="FitScaleIndex"/>.
+        /// </summary>
+        private int GetRungAbove(double factor)
+        {
+            for (int n = FitScaleIndex + 1; n < _scaleItems.Count; ++n)
+            {
+                if (GetRungFactor(n) > factor)
+                {
+                    return n;
+                }
+            }
+
+            return _scaleItems.Count - 1;
+        }
+
+        /// <summary>
+        /// Parses a ladder entry. Not valid for <see cref="FitScaleIndex"/>, which carries no
+        /// percentage.
+        /// </summary>
+        private double GetRungFactor(int index)
+        {
+            return double.Parse(_scaleItems[index].TrimEnd('%')) / 100;
+        }
+
         private void OnScaleChanged(bool invoke)
         {
             try
@@ -448,8 +477,7 @@ namespace AvantGarde.ViewModels
                     // The fit entry carries no percentage. Its factor is computed against the
                     // viewport and pushed in by SetFitScaleFactor, so the last ladder value is
                     // held here until that happens.
-                    var s = _scaleItems[_scaleSelectedIndex];
-                    ScaleFactor = double.Parse(s.TrimEnd('%')) / 100;
+                    ScaleFactor = GetRungFactor(_scaleSelectedIndex);
                 }
 
                 this.RaisePropertyChanged(nameof(ScaleFactor));
