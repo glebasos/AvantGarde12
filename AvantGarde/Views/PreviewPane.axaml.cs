@@ -17,9 +17,9 @@
 // -----------------------------------------------------------------------------
 
 using System.Diagnostics;
-using System.Runtime.InteropServices;
 using Avalonia.Controls;
 using Avalonia.Input;
+using Avalonia.Input.Platform;
 using Avalonia.Threading;
 using AvantGarde.Loading;
 using AvantGarde.Projects;
@@ -218,29 +218,13 @@ public partial class PreviewPane : UserControl
 
         var bmp = PreviewControl.GetBitmap();
 
-        if (bmp != null)
+        if (bmp != null && window.Clipboard != null)
         {
-            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-            {
-                // Windows currently needs a helper
-                await Clowd.Clipboard.ClipboardAvalonia.SetImageAsync(bmp);
-                return;
-            }
-
-
-            // Linux (mac?)
-            using var ms = new MemoryStream();
-            bmp.Save(ms);
-            ms.Seek(0, SeekOrigin.Begin);
-
-            var data = new DataObject();
-            data.Set("image/png", ms.ToArray());
-
-            if (window.Clipboard != null)
-            {
-                await window.Clipboard.SetDataObjectAsync(data);
-            }
-         }
+            // Avalonia 12 provides a cross-platform bitmap clipboard. This replaces both the
+            // Windows-only Clowd.Clipboard helper (an unmaintained Avalonia 11 package) and the
+            // manual image/png DataObject used elsewhere -- DataObject is obsolete in 12.
+            await window.Clipboard.SetBitmapAsync(bmp);
+        }
     }
 
     /// <summary>

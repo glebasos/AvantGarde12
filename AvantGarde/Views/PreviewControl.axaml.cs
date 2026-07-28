@@ -158,7 +158,7 @@ public partial class PreviewControl : UserControl
                 // Keep window from displaying
                 window.ShowInTaskbar = false;
                 window.WindowState = WindowState.Minimized;
-                window.SystemDecorations = SystemDecorations.None;
+                window.WindowDecorations = WindowDecorations.None;
 
                 window.Content = clone;
                 window.SizeToContent = SizeToContent.WidthAndHeight;

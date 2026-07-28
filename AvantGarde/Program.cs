@@ -18,7 +18,7 @@
 
 using System.Reflection;
 using Avalonia;
-using Avalonia.ReactiveUI;
+using ReactiveUI.Avalonia;
 using AvantGarde.Utility;
 
 namespace AvantGarde;
@@ -102,6 +102,10 @@ class Program
     // Avalonia configuration, don't remove; also used by visual designer.
     public static AppBuilder BuildAvaloniaApp()
     {
-        return AppBuilder.Configure<App>().UsePlatformDetect().LogToTrace().UseReactiveUI();
+        // ReactiveUI 24 (via ReactiveUI.Avalonia 12) requires an explicit builder action where the
+        // old parameterless UseReactiveUI() sufficed. WithAvalonia() registers the Avalonia platform
+        // services; no view registration is needed, as nothing here implements IViewFor.
+        return AppBuilder.Configure<App>().UsePlatformDetect().LogToTrace()
+            .UseReactiveUI(builder => builder.WithAvalonia());
     }
 }

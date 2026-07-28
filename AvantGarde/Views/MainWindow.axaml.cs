@@ -1,4 +1,4 @@
-// -----------------------------------------------------------------------------
+﻿// -----------------------------------------------------------------------------
 // PROJECT   : Avant Garde
 // COPYRIGHT : Andy Thomas (C) 2022-25
 // LICENSE   : GPL-3.0-or-later
@@ -75,9 +75,6 @@ public partial class MainWindow : AvantWindow<MainWindowViewModel>
 
         PropertyChanged += PropertyChangedHandler;
         LoadFlagCheckedHandler(PreviewPane.LoadFlags);
-#if DEBUG
-        this.AttachDevTools();
-#endif
     }
 
     public async void OpenSolutionDialog()

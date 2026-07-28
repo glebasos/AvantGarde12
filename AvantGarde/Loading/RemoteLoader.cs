@@ -390,9 +390,16 @@ public sealed class RemoteLoader : IDisposable
             catch (Exception e)
             {
                 Debug.WriteLine("EXCEPTION:" + e);
+
+                // Capture before StopNoSync(), which clears the output buffer. Host startup
+                // failures are reported only on the host's stderr, so wiping it here left the
+                // user with a bare "Timed out waiting for ..." and no cause.
+                var output = GetProcessOutput();
                 StopNoSync();
 
-                InvokePreviewReady(CreatePreview(factory, new PreviewError(e.Message)));
+                var payload = CreatePreview(factory, new PreviewError(e.Message));
+                payload.Output = output ?? payload.Output;
+                InvokePreviewReady(payload);
             }
         }
     }
@@ -460,7 +467,10 @@ public sealed class RemoteLoader : IDisposable
             dotnet = "dotnet";
         }
 
-        var args = $@"exec --runtimeconfig ""{load.AppConfigPath}"" --depsfile ""{load.AppDepsPath}"" ""{host}"" --transport tcp-bson://127.0.0.1:{port}/ ""{load.AppAssembly}""";
+        // --method is passed explicitly rather than relying on the host default. The host supports
+        // 'avalonia-remote', 'win32' and 'html'; if the default ever changes we would silently
+        // receive HtmlTransportStartedMessage and never a frame.
+        var args = $@"exec --runtimeconfig ""{load.AppConfigPath}"" --depsfile ""{load.AppDepsPath}"" ""{host}"" --transport tcp-bson://127.0.0.1:{port}/ --method avalonia-remote ""{load.AppAssembly}""";
 
         Debug.WriteLine($"STARTING: {dotnet} {args}");
         v_listener = new BsonTcpTransport().Listen(IPAddress.Loopback, port, c => { v_connection = c; });
@@ -703,9 +713,20 @@ public sealed class RemoteLoader : IDisposable
 
     private void ProcessOutputHandler(object? sender, DataReceivedEventArgs e)
     {
-        if (v_factory != null && !string.IsNullOrWhiteSpace(e.Data))
+        if (string.IsNullOrWhiteSpace(e.Data))
         {
-            InvokeOutputReceived(AppendOutput(e.Data));
+            return;
+        }
+
+        // Always buffer. Output produced during StartHostNoSync arrives while v_factory is still
+        // null, and that is exactly where fatal host startup errors appear (a host built for the
+        // wrong TFM dies with "Could not load file or assembly 'System.Runtime'"). Only the UI
+        // notification is gated on there being a factory to attach it to.
+        var output = AppendOutput(e.Data);
+
+        if (v_factory != null)
+        {
+            InvokeOutputReceived(output);
         }
     }
 
