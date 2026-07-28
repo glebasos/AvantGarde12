@@ -177,7 +177,16 @@ public sealed class DotnetSolution : PathItem
     {
         lock (_pending)
         {
-            _pending.Clear();
+            if (_pending.Count != 0)
+            {
+                // A batch is already in flight. Starting a second one here would strand any project
+                // it marks: the running batch copied its own list before this call and clears the
+                // shared one when it ends, leaving the newly marked project flagged as evaluating
+                // with nothing left to run or clear it - permanently "Resolving project...", and
+                // never evaluated again. A stamp that moved meanwhile is picked up on the next
+                // tick, once the running batch has finished.
+                return false;
+            }
 
             foreach (var item in Projects.Values)
             {

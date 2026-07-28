@@ -67,6 +67,14 @@ second, so:
 **Evaluation writes nothing.** Measured by timestamping the fixture tree before and after: no file
 changes, so it cannot trip `BuildWatcher`.
 
+**Only one batch runs at a time**, enforced in `DotnetSolution.BeginEvaluation` by refusing to start
+while `_pending` is non-empty. Without that, a stamp moving *during* a batch strands a project: the
+running batch copied its own list before the second `BeginEvaluation` marked the project, then clears
+the shared list on exit, leaving that project flagged as evaluating with nothing left to clear it —
+permanently "Resolving project...", and never evaluated again for the session. Exercised by touching
+a `.csproj` and `Directory.Build.props` every 200 ms across the whole in-flight window: three
+evaluation batches started, three completed, and the tree settled correctly with nothing stuck.
+
 ## Also in this milestone
 
 - **`.slnx`** — recognised as a solution kind, added to the file picker and the `FindArtifactsDirectory`
@@ -117,6 +125,9 @@ Observed during this work; none blocks Milestone 1, all worth knowing.
 - **One spurious `BuildWatcher` restart per open.** The watcher's first poll always reports a change,
   so every opened preview is suspended and restarted once. Confirmed present before this milestone
   and unchanged by it — a Milestone 5 item (polling → real watchers).
+- **The cache stamp stops at the solution directory.** `GetEvaluationStamp` walks up from the project
+  to the solution root, so a `Directory.Build.props` *above* the solution never invalidates the
+  cache. Rare, and the walk is capped at eight levels anyway; reopening the solution picks it up.
 - **`ProjectTree` still uses `TreeViewItem` as data items.** Two of its failure modes were fixed here
   and in Milestone 0 (nested selection could not be set; selection was dropped on rebuild), but the
   design PLAN.md Milestone 5 wants rewritten is intact.
