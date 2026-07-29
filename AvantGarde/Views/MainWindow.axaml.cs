@@ -42,6 +42,11 @@ public partial class MainWindow : AvantWindow<MainWindowViewModel>
     private bool _writeSettingsFlag;
     private bool _isBuilding;
 
+    // Set where a build was detected but the preview was left running through it, which is what
+    // shadow copy allows. See RefreshTimerHandler - the host still has the previous assemblies
+    // loaded and nothing else would restart it.
+    private bool _restartAfterBuild;
+
     // Added to watch for build changes
     private BuildWatcher? _buildWatcher;
 
@@ -78,6 +83,7 @@ public partial class MainWindow : AvantWindow<MainWindowViewModel>
         Model.WelcomeWidth = ExplorerPane.MinWorkingWidth;
         Model.IsPinVisible = App.Settings.ShowPin;
         PreviewPane.WindowTheme = App.Settings.PreviewTheme;
+        _loader.IsShadowCopyEnabled = App.Settings.IsShadowCopy;
 
         PropertyChanged += PropertyChangedHandler;
         LoadFlagCheckedHandler(PreviewPane.LoadFlags);
@@ -261,6 +267,10 @@ public partial class MainWindow : AvantWindow<MainWindowViewModel>
             Model.IsWelcomeVisible = GetIsWelcomeVisible(ExplorerPane.Solution != null);
             Model.IsPinVisible = App.Settings.ShowPin;
             PreviewPane.WindowTheme = App.Settings.PreviewTheme;
+
+            // Takes effect on the next host start. Any restart owed by a build the running host
+            // was going to sit through has already been dropped by the ResetWatcher above.
+            _loader.IsShadowCopyEnabled = App.Settings.IsShadowCopy;
         }
     }
 
@@ -434,6 +444,10 @@ public partial class MainWindow : AvantWindow<MainWindowViewModel>
 
     private void ResetWatcher(DotnetProject? project)
     {
+        // Any owed restart belonged to the watcher going away, and the new one starts with its
+        // own idea of when the directory it watches last changed.
+        _restartAfterBuild = false;
+
         // Dispose of any existing
         _buildWatcher?.Dispose();
         _buildWatcher = null;
@@ -726,22 +740,51 @@ public partial class MainWindow : AvantWindow<MainWindowViewModel>
             if (_buildWatcher != null && _buildWatcher.IsChanged())
             {
                 Debug.WriteLine("BUILD CHANGE DETECTED");
-                Debug.WriteLine($"Halt preview host for: {_buildWatcher.DirectoryPath}");
-                PreviewPane.IsPreviewSuspended = true;
 
-                // Stop the preview host
-                _loader.Stop();
+                if (_loader.IsShadowCopyEnabled)
+                {
+                    // The host is running from a copy, so it is not what a build would trip over
+                    // and there is nothing to gain by taking the preview down. It goes on showing
+                    // the last frame until the output is quiet enough to restart against.
+                    Debug.WriteLine($"Preview left running for: {_buildWatcher.DirectoryPath}");
+                    _restartAfterBuild = true;
+                }
+                else
+                {
+                    Debug.WriteLine($"Halt preview host for: {_buildWatcher.DirectoryPath}");
+                    PreviewPane.IsPreviewSuspended = true;
+
+                    // Stop the preview host
+                    _loader.Stop();
+                }
             }
             else
-            if (_buildWatcher != null && PreviewPane.IsPreviewSuspended && _buildWatcher.Elapsed > RefreshInterval)
+            if (_buildWatcher != null && _buildWatcher.Elapsed > RefreshInterval &&
+                (PreviewPane.IsPreviewSuspended || _restartAfterBuild))
             {
                 Debug.WriteLine("RESTART AFTER BUILD");
+
+                if (_restartAfterBuild)
+                {
+                    // Explicit, and not left to the app assembly change that UpdateThread detects.
+                    // Getting it wrong here is worse than a redundant restart: a host left running
+                    // is a host still serving the previous copy, and it would answer XAML updates
+                    // from stale code without reporting anything.
+                    _restartAfterBuild = false;
+                    _loader.Stop();
+                }
+
                 PreviewPane.IsPreviewSuspended = false;
                 UpdateLoader(ExplorerPane.SelectedItem);
             }
             else
-            if (refreshed && !PreviewPane.IsPreviewSuspended)
+            if (refreshed && !PreviewPane.IsPreviewSuspended && !_restartAfterBuild)
             {
+                // The _restartAfterBuild guard matters only with shadow copy on, where the preview
+                // is deliberately left up through a build. Refresh reports a change on every tick
+                // while the output directory is being rewritten, and UpdateLoader answers a build
+                // in flight with "Please wait..." - which would replace the live preview with a
+                // placeholder, the very thing that is being avoided.
                 // Non-blocking
                 Debug.WriteLine("EXPLORER REFRESH");
                 Debug.WriteLine($"Selected: {ExplorerPane.SelectedItem?.ToString() ?? "null"}");

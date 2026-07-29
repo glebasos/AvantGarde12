@@ -75,6 +75,7 @@ public partial class SettingsWindow : AvantWindow
         PreviewCombo.SelectedItem = settings.PreviewTheme;
         WelcomeCheck.IsChecked = settings.ShowWelcome;
         PinCheck.IsChecked = settings.ShowPin;
+        ShadowCheck.IsChecked = settings.IsShadowCopy;
     }
 
     private void ResetClickHandler(object? sender, RoutedEventArgs e)
@@ -113,6 +114,7 @@ public partial class SettingsWindow : AvantWindow
             Settings.PreviewTheme = (PreviewWindowTheme?)PreviewCombo.SelectedItem ?? PreviewWindowTheme.DarkGray;
             Settings.ShowWelcome = WelcomeCheck.IsChecked == true;
             Settings.ShowPin = PinCheck.IsChecked == true;
+            Settings.IsShadowCopy = ShadowCheck.IsChecked == true;
             Debug.WriteLine(Settings.PreviewTheme);
         }
 

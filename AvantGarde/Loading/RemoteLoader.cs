@@ -42,6 +42,11 @@ public sealed class RemoteLoader : IDisposable
     private static readonly Vector Dpi = new(96, 96);
     private const string DotnetHostName = "Avalonia.Designer.HostApp.dll";
 
+    // Milliseconds to wait for a killed host to actually go. Process.Kill only requests the
+    // termination, and the shadow copy taken moments later overwrites files the dying process may
+    // still have mapped. See StopNoSync.
+    private const int ExitTimeout = 2000;
+
     // Milliseconds to wait for StartDesignerSessionMessage after the host connects. Measured, the
     // message arrives within a few milliseconds of the accept, so this is generous. It is separate
     // from Timeout because that governs process start, and a host which connects but never
@@ -108,6 +113,12 @@ public sealed class RemoteLoader : IDisposable
 
     private volatile int v_maxFrameRate = DefaultFrameRate;
     private volatile bool v_renderPaused;
+    private volatile bool v_shadowCopy;
+
+    // Both under _startSync, which is held across the whole of StartHostNoSync and SendXaml - the
+    // only two places either is touched.
+    private ShadowCopier? _copier;
+    private ShadowPaths? _shadow;
 
     // All under _viewportSync.
     private double _scale = 1.0;
@@ -204,6 +215,25 @@ public sealed class RemoteLoader : IDisposable
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Gets or sets whether the designer host is run against a temporary copy of the build output
+    /// rather than the output itself. A change takes effect the next time the host is started.
+    /// </summary>
+    /// <remarks>
+    /// The host holds every assembly it loads open for its lifetime, so without this a build of
+    /// the project being previewed fails on a locked file unless the host is stopped first - which
+    /// is why <see cref="Projects.BuildWatcher"/> exists and why the preview comes down on every
+    /// build. With it, the only thing the build changes is that a restart is owed afterwards.
+    ///
+    /// A copy which cannot be taken is reported and the host is started from the output directory
+    /// as before, so the failure costs the locking behaviour and not the preview.
+    /// </remarks>
+    public bool IsShadowCopyEnabled
+    {
+        get { return v_shadowCopy; }
+        set { v_shadowCopy = value; }
     }
 
     /// <summary>
@@ -476,6 +506,11 @@ public sealed class RemoteLoader : IDisposable
                 v_disposed = true;
                 StopNoSync();
                 _ackTimer.Dispose();
+
+                // After StopNoSync, which has waited for the host to exit. Disposing the copier
+                // deletes the mirrors, and a live host would hold them open.
+                _copier?.Dispose();
+                _copier = null;
             }
             catch
             {
@@ -716,6 +751,10 @@ public sealed class RemoteLoader : IDisposable
     {
         v_factory = null;
 
+        // The mirror itself is kept - it is what makes the next copy incremental - but the paths
+        // belong to the host being stopped.
+        _shadow = null;
+
         // Every host gets its own session. Left set, these would let the next host pass its gate on
         // the previous one's announcement - and a rebuild restarts the host, so that is routine.
         v_sessionId = null;
@@ -763,6 +802,15 @@ public sealed class RemoteLoader : IDisposable
             {
                 Debug.WriteLine("Kill process");
                 proc.Kill();
+
+                // Kill only asks. The next shadow copy overwrites the very files the dying process
+                // has mapped, and starts within milliseconds of this, so waiting is not optional
+                // there - and where the copy is off, waiting costs a few milliseconds of a path
+                // which already allows itself ten seconds.
+                if (!proc.WaitForExit(ExitTimeout))
+                {
+                    Debug.WriteLine($"Host still running {ExitTimeout}ms after kill");
+                }
             }
             catch (Exception e)
             {
@@ -789,6 +837,14 @@ public sealed class RemoteLoader : IDisposable
         var host = ResolveDesignerHost(load);
         Debug.WriteLine("Host: " + host.FullName);
 
+        // Everything below launches from these rather than from the payload, so that the shadow
+        // copy is invisible to the rest of the class. The payload keeps stating the real output,
+        // which is what change detection and the build watcher must go on seeing.
+        _shadow = v_shadowCopy ? CreateShadowNoSync(load) : null;
+        var appAssembly = _shadow?.AppAssembly ?? load.AppAssembly;
+        var appConfig = _shadow?.AppConfigPath ?? load.AppConfigPath;
+        var appDeps = _shadow?.AppDepsPath ?? load.AppDepsPath;
+
         // Identifies this host instance. The value is echoed back verbatim in
         // StartDesignerSessionMessage (measured against 12.0.5), so a host left over from an
         // earlier run which reaches a recycled port can be told apart from the one just started.
@@ -812,7 +868,7 @@ public sealed class RemoteLoader : IDisposable
         // --method is passed explicitly rather than relying on the host default. The host supports
         // 'avalonia-remote', 'win32' and 'html'; if the default ever changes we would silently
         // receive HtmlTransportStartedMessage and never a frame.
-        var args = $@"exec --runtimeconfig ""{load.AppConfigPath}"" --depsfile ""{load.AppDepsPath}"" ""{host}"" --transport tcp-bson://127.0.0.1:{port}/ --method avalonia-remote --session-id ""{session}"" ""{load.AppAssembly}""";
+        var args = $@"exec --runtimeconfig ""{appConfig}"" --depsfile ""{appDeps}"" ""{host}"" --transport tcp-bson://127.0.0.1:{port}/ --method avalonia-remote --session-id ""{session}"" ""{appAssembly}""";
 
         Debug.WriteLine($"STARTING: {dotnet} {args}");
 
@@ -824,6 +880,10 @@ public sealed class RemoteLoader : IDisposable
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
+
+            // Left where upstream put it, and specifically not pointed at either the output
+            // directory or the shadow copy. A working directory is an open handle on that
+            // directory, which is the one thing the shadow copy exists to avoid holding.
             WorkingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
         };
 
@@ -939,6 +999,79 @@ public sealed class RemoteLoader : IDisposable
     }
 
     /// <summary>
+    /// Mirrors the build output and returns the paths to launch from, or null where no copy could
+    /// be taken - in which case the caller launches from the output directory as before. Under
+    /// <see cref="_startSync"/>, and only ever with the host stopped.
+    /// </summary>
+    /// <remarks>
+    /// Two directories can be involved. The application assembly is one, and where a library
+    /// control is being previewed through an application the library's own output is the other,
+    /// because <see cref="SendXaml"/> sends the library assembly from its own build directory
+    /// rather than the copy of it in the application's.
+    /// </remarks>
+    private ShadowPaths? CreateShadowNoSync(LoadPayload load)
+    {
+        var appDir = GetDirectoryOrNull(load.AppAssembly);
+
+        if (appDir == null)
+        {
+            // Nothing to copy. The launch below fails on the missing assembly, as it would anyway.
+            return null;
+        }
+
+        try
+        {
+            var clock = Stopwatch.StartNew();
+
+            if (_copier == null)
+            {
+                _copier = new ShadowCopier();
+                ShadowCopier.SweepStaleRoots(ShadowCopier.GetDefaultParent(),
+                    Path.GetFileName(_copier.Root));
+            }
+
+            _copier.Mirror(appDir);
+
+            var projDir = GetDirectoryOrNull(load.ProjectAssembly);
+
+            if (projDir != null && !projDir.Equals(appDir, StringComparison.OrdinalIgnoreCase))
+            {
+                _copier.Mirror(projDir);
+            }
+
+            var paths = new ShadowPaths();
+            paths.AppAssembly = _copier.Remap(load.AppAssembly) ??
+                throw new InvalidOperationException("Failed to shadow " + load.AppAssembly);
+
+            paths.AppConfigPath = _copier.Remap(load.AppConfigPath);
+            paths.AppDepsPath = _copier.Remap(load.AppDepsPath);
+            paths.ProjectAssembly = _copier.Remap(load.ProjectAssembly);
+
+            Debug.WriteLine($"Shadow copy took {clock.ElapsedMilliseconds}ms");
+            return paths;
+        }
+        catch (Exception e)
+        {
+            // Reported rather than swallowed. The preview still works without a copy; what is lost
+            // is that a build will again fail on the locked output, and the user would otherwise
+            // have no way to connect the two.
+            AppendAppOutput("Shadow copy failed, running from the build output instead - " + e.Message);
+            return null;
+        }
+    }
+
+    private static string? GetDirectoryOrNull(string? file)
+    {
+        if (string.IsNullOrEmpty(file))
+        {
+            return null;
+        }
+
+        var dir = Path.GetDirectoryName(file);
+        return !string.IsNullOrEmpty(dir) ? dir : null;
+    }
+
+    /// <summary>
     /// Returns the designer host to launch. MSBuild's answer is preferred; the NuGet cache lookup
     /// is the fallback for a project that could not be evaluated.
     /// </summary>
@@ -978,7 +1111,10 @@ public sealed class RemoteLoader : IDisposable
     {
         Debug.WriteLine($"{nameof(RemoteLoader)}.{nameof(SendXaml)}");
         var msg = new UpdateXamlMessage();
-        msg.AssemblyPath = factory.Load.ProjectAssembly;
+
+        // Under _startSync, which every caller holds. The host resolves this itself, so it has to
+        // be the copy the running host was started against and not the project's own output.
+        msg.AssemblyPath = _shadow?.ProjectAssembly ?? factory.Load.ProjectAssembly;
 
         msg.Xaml = factory.GetXaml() ??
             throw new ArgumentNullException(nameof(msg.Xaml));
@@ -1607,6 +1743,19 @@ public sealed class RemoteLoader : IDisposable
     private void ErrorHandler(IAvaloniaRemoteTransportConnection cnx, Exception e)
     {
         Debug.WriteLine("CONNECTION ERROR: " + e.Message);
+    }
+
+    /// <summary>
+    /// The paths a running host was started against, where they are not the project's own. Held
+    /// for the lifetime of that host, because the XAML updates sent to it have to name the same
+    /// copy the host was launched from.
+    /// </summary>
+    private sealed class ShadowPaths
+    {
+        public string? AppAssembly;
+        public string? AppConfigPath;
+        public string? AppDepsPath;
+        public string? ProjectAssembly;
     }
 
 }
