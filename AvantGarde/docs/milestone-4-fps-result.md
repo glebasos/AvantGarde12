@@ -103,14 +103,27 @@ trace timestamped as it was read.
    Both orderings were exercised — see 6 for the other.
 6. **A frame arriving while paused is withheld and still displayed.** Minimize, then edit the file
    while minimized: `Ack withheld - paused: 1`, the payload is delivered anyway, and on restore the
-   preview already shows the edit. This is the branch the animation runs rarely hit, and it confirms
-   the claim in `IsRenderPaused`'s remarks: only the picture waits, the compile and its errors do not.
-7. **No regression on the ordinary path.** `AvaloniaMvvm` `MainWindow.axaml` renders; an edit
+   preview already shows the edit. This is the branch the animation runs rarely hit.
+7. **The host still compiles and still reports errors while paused.** Measured rather than inferred,
+   because it is a claim about host behaviour and this repo has been wrong about those before.
+   Minimize, then write markup the *host* must reject — `TextBlockk`, well-formed XML naming a type
+   that does not exist — and `UpdateXamlResultMessage` arrives 1.1 s later, while the frame channel
+   is stalled. **A malformed-XML error does not test this**: `PreviewFactory` parses the markup
+   before sending, so "Unexpected end of file" never reaches the host and would prove nothing about
+   the pause.
+8. **No regression on the ordinary path.** `AvaloniaMvvm` `MainWindow.axaml` renders; an edit
    (alignment and font size) appears; a deliberate syntax error shows the message and a **Goto**
    button; restoring the file recovers. Screenshots at each step.
-8. **Two-assembly path unregressed.** `MultiProjectSolution`'s `MyControl.axaml` from
+9. **Two-assembly path unregressed.** `MultiProjectSolution`'s `MyControl.axaml` from
    `ClassLibrary1.dll` still previews. Two frames, 52 ms apart, neither deferred — correctly, since
    the first ack is never delayed and 52 ms exceeds the interval.
+10. **Fit-to-window is unaffected, because the cap cannot bind there.** Re-run of the milestone-4
+    resize gesture with the cap in place: select **Fit**, then shrink the window over 40 steps in
+    4.4 s. The drag produces **no** scale pushes at all — one lands 52 ms after it ends — and each
+    push yields two frames, the first arriving 18 ms later and **never deferred**, since the previous
+    ack was sent long before. Only the duplicate second frame of each pair is deferred, by 20 ms, and
+    it is identical to the first. Resize latency is therefore unchanged by pacing: the path runs at a
+    few frames a second, nowhere near the limit.
 
 The probe used a temporary `AnimProbe.axaml` in the `AvaloniaMvvm` fixture, since deleted — a stray
 `.axaml` under an Avalonia project would be globbed on the next fixture rebuild. It is worth
