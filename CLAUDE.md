@@ -37,11 +37,14 @@ previewer compatibility — that is Milestones 1 and 2.
 - **[AvantGarde/docs/milestone-4-build-result.md](AvantGarde/docs/milestone-4-build-result.md)** —
   build on demand, and why the post-build recovery belongs to `RefreshTimerHandler` rather than to
   the build. Read before adding anything that restarts the preview.
+- **[AvantGarde/docs/milestone-4-shadow-result.md](AvantGarde/docs/milestone-4-shadow-result.md)** —
+  shadow copy: what the mirror leaves out and why, the mid-build race the trace exposed, and the
+  measured before/after on build lock diagnostics. Read before touching the host launch paths.
 
 ## Where things stand
 
-**Milestones 0–3 are done, and Milestone 4 items 1–6.** App on Avalonia 12.1.0 / net10.0,
-0 warnings (Debug *and* Release), 92/92 tests. Milestone 3 was done ahead of Milestones 1–2 at the
+**Milestones 0–3 are done, and Milestone 4 items 1–7.** App on Avalonia 12.1.0 / net10.0,
+0 warnings (Debug *and* Release), 105/105 tests. Milestone 3 was done ahead of Milestones 1–2 at the
 user's direction.
 
 Dependency outcomes, which differ from what PLAN.md assumes:
@@ -72,8 +75,8 @@ Evaluation costs ~0.6 s per project, so it is worker-thread only: `BeginEvaluati
 thread marks projects and shows "Resolving project...", then `Evaluate()` runs on a worker, then
 `Refresh()` applies. `UpdateLoader` defers previewing while it is in flight.
 
-**Milestone 4 items 7–8 are next** (shadow copy, theme injection), with Milestone 5's internal debt
-taken opportunistically.
+**Milestone 4 item 8 is next** (theme injection), with Milestone 5's internal debt taken
+opportunistically.
 
 **A build started from AvantGarde must not restart the preview itself.** `ProjectBuilder` shells
 `dotnet build`; `MainWindow.BuildProject` stops the host, suspends, and then hands recovery to
@@ -82,6 +85,18 @@ own completion hits `UpdateLoader`'s `"Please wait..."` branch, because a build 
 `BuildWatcher` clock that guard reads. The converse also holds: `RefreshTimerHandler` returns early
 while `_isBuilding`, or its un-suspend branch fires in the quiet stretch before MSBuild writes
 anything and starts a host against the assembly being replaced.
+
+**Shadow copy exists, is opt-in, and changes what a build does to the preview.** With
+`RemoteLoader.IsShadowCopyEnabled` set (Preferences → Shadow Copy, off by default) the host runs from
+a mirror under `%TEMP%/AvantGarde-Shadow/<pid>/`, so a build takes no locks off it: measured, 12
+`MSB3061` lock diagnostics with the copy off and none with it on. `RefreshTimerHandler` then leaves
+the preview up through the build and records `_restartAfterBuild` instead of suspending — and that
+flag also has to suppress the `refreshed` branch, or `UpdateLoader` answers a build in flight with
+`"Please wait..."` and replaces the live preview anyway. The post-build `_loader.Stop()` is
+deliberate and must stay: a host left running is a host still serving the previous copy, and it would
+answer XAML updates from stale code silently. The mirror is **not** a verbatim copy — it excludes
+foreign `runtimes/<rid>/` subtrees and native `.pdb`s, which is the difference between 566 MiB and
+33 MiB on the fixtures. Both mirrored directories matter in the two-assembly case.
 
 **Frames are paced by the ack, and the host stalls without one.** Measured: withhold
 `FrameReceivedMessage` and exactly one frame arrives, then nothing — and the host does not queue
@@ -153,7 +168,7 @@ Everything before `808f084 v1.6.0` is upstream; the `wip` commits on top are thi
 
 ```
 dotnet build AvantGarde.sln          # must stay clean, zero new warnings
-dotnet test AvantGarde.Test          # 92 facts; Loading/ covered only for InputMapper, FrameRateLimiter, PreviewFactory errors
+dotnet test AvantGarde.Test          # 105 facts; Loading/ covered only for InputMapper, FrameRateLimiter, ShadowCopier, PreviewFactory errors
 ```
 
 Two Avalonia 12.0.5 fixtures, in **different** places — the second is not where PLAN.md says:
@@ -200,7 +215,8 @@ differential probe) — copy the `Exec` line from
   timer). Know which one applies before adding state; don't assume `v_` means "protected."
   `_viewportSync` and `_ackSync` are always **inner** locks — take them while holding `_startSync`,
   never the reverse — and neither may be held across blocking work, which is the whole reason scale
-  was moved out of `_startSync`.
+  was moved out of `_startSync`. `_copier` and `_shadow` are plain fields guarded by `_startSync`,
+  which every path touching them already holds.
 - Upstream comment style is sparse; the migration comments explaining *why* a non-obvious workaround
   exists (as in `RemoteLoader.ProcessOutputHandler`) are deliberate. Match that: explain the
   non-obvious, not the obvious.
