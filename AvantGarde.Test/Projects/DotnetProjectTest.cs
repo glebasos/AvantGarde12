@@ -191,6 +191,13 @@ public class DotnetProjectTest(ITestOutputHelper helper) : TestUtilBase(helper)
         // The one error AvantGarde can clear itself, and the only one carrying a Build button.
         Assert.Equal("Debug assembly not found", item.Error?.Message);
         Assert.True(item.Error?.IsBuildable);
+
+        // Except where the user stated the path. Building would not put a file there.
+        item.Properties.AssemblyOverride = "elsewhere/Name.Test.dll";
+        Assert.True(item.Refresh());
+
+        Assert.Equal("Debug assembly not found", item.Error?.Message);
+        Assert.False(item.Error?.IsBuildable);
     }
 
     [Fact]

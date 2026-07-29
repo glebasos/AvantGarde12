@@ -106,6 +106,8 @@ public partial class MainWindow : AvantWindow<MainWindowViewModel>
         Debug.WriteLine($"{nameof(MainWindow)}.{nameof(OpenSolution)}");
         Debug.WriteLine(path);
 
+        ClearBuildOutput();
+
         try
         {
             var sol = new DotnetSolution(path);
@@ -184,6 +186,7 @@ public partial class MainWindow : AvantWindow<MainWindowViewModel>
     {
         Debug.WriteLine($"{nameof(MainWindow)}.{nameof(CloseSolution)}");
 
+        ClearBuildOutput();
         ResetWatcher(null);
         ExplorerPane.Solution = null;
         PreviewPane.HasSolution = false;
@@ -298,11 +301,7 @@ public partial class MainWindow : AvantWindow<MainWindowViewModel>
         try
         {
             PreviewPane.IsBuildEnabled = false;
-
-            lock (_buildOutput)
-            {
-                _buildOutput.Clear();
-            }
+            ClearBuildOutput();
 
             // The designer host holds the output assembly open, so it has to stop before MSBuild can
             // overwrite it - the same reason BuildWatcher stops it for a build started elsewhere.
@@ -524,6 +523,14 @@ public partial class MainWindow : AvantWindow<MainWindowViewModel>
         Dispatcher.UIThread.Post(RestoreBuildOutput);
     }
 
+    private void ClearBuildOutput()
+    {
+        lock (_buildOutput)
+        {
+            _buildOutput.Clear();
+        }
+    }
+
     private void RestoreBuildOutput()
     {
         lock (_buildOutput)
@@ -537,6 +544,10 @@ public partial class MainWindow : AvantWindow<MainWindowViewModel>
 
     private void OutputReceivedHandler(string output)
     {
+        // The designer host has something to say, which supersedes the build log and ends the
+        // reassertion in PreviewReadyHandler - otherwise a log with no host to displace it would
+        // follow the user to whatever they select next.
+        ClearBuildOutput();
         PreviewPane.OutputText = output;
     }
 

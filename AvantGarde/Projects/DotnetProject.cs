@@ -612,9 +612,11 @@ public sealed class DotnetProject : PathItem
         if (AssemblyPath == null || !AssemblyPath.Exists)
         {
             // The one error AvantGarde can act on itself. Everything else here needs the user to
-            // change something first, so only this one carries the build affordance.
+            // change something first, so only this one carries the build affordance - and not even
+            // this one where the path came from AssemblyOverride, since building the project will
+            // not put a file where the user pointed.
             return new ProjectError(this, Solution.Properties.Build + " assembly not found",
-                "Build project or set custom path", true);
+                "Build project or set custom path", !_customOverride);
         }
 
         if (AssemblyPath.Kind != PathKind.Assembly)

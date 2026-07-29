@@ -60,6 +60,21 @@ whenever the incoming payload has none. It is a reassert, not a merge: the host'
 it the moment there is any, which is visible in the retry screenshot where the pane switches from
 compiler errors to `Initializing application in design mode`.
 
+The reassert needs a matching end, or a log with no host to displace it follows the user to whatever
+they select next. `ClearBuildOutput` runs at the start of a build, on the first line of host output,
+and on opening or closing a solution.
+
+## The pane was scrolled off the message
+
+`XamlCodeControl.OutputText` tail-followed with `CaretIndex = int.MaxValue`. That is fine for host
+output, whose lines are short, but MSBuild diagnostics begin with an absolute project path, so
+scrolling to the *end* of the last line put `error CSxxxx` off the left edge — the pane opened by
+itself and showed a path where the reason should be. The caret now goes to the start of the last
+line: vertical tail-following is unchanged, horizontal scrolling is gone. Host output benefits too.
+
+Caught only by looking at the screenshot. Grepping the trace confirmed the diagnostics were
+*captured*, which is a different claim from *readable*.
+
 ## Deliberately not done
 
 - **The app project is never built implicitly.** The button builds the project that reported the
@@ -68,6 +83,10 @@ compiler errors to `Initializing application in design mode`.
   whether its assembly exists — and the failure appears later, from `RemoteLoader`. That gap predates
   this item and is left alone. In the fixture the point is moot: `AvaloniaApp1` references
   `ClassLibrary1`, so building either from its own error is enough.
+- **No button on a custom assembly path.** `CheckForError`'s missing-assembly branch also fires for a
+  `ProjectProperties.AssemblyOverride` that points nowhere, and building cannot put a file where the
+  user pointed. `IsBuildable` is therefore `!_customOverride`, so that case keeps the error and loses
+  the button.
 - **No "Project not restored" affordance.** `dotnet build` restores, so extending the button there is
   a one-line change. The plan attaches it to the missing assembly; the restore error is one the user
   is told to fix themselves, and widening it was not asked for.
@@ -78,10 +97,11 @@ compiler errors to `Initializing application in design mode`.
 
 ## Verification
 
-`dotnet build AvantGarde.sln` clean (0 warnings), `dotnet test AvantGarde.Test` 92/92 — eight new
-facts: five over `ProjectBuilder` (including a real `Release` build asserting the configuration
-reaches MSBuild, and a real failing build asserting the diagnostic is captured), two over the
-`ProjectError` → `PreviewError` chain, one over `CheckForError`.
+`dotnet build AvantGarde.sln` clean (0 warnings, Debug *and* Release), `dotnet test AvantGarde.Test`
+92/92 — eight new facts: five over `ProjectBuilder` (including a real `Release` build asserting the
+configuration reaches MSBuild, and a real failing build asserting the diagnostic is captured), two
+over the `ProjectError` → `PreviewError` chain, one over `CheckForError` covering both the buildable
+missing assembly and the non-buildable override.
 
 Both fixtures, with `bin/` removed and `obj/` left in place so the error is the missing assembly
 rather than a missing restore:
