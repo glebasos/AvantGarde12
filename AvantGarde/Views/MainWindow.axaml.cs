@@ -394,6 +394,11 @@ public partial class MainWindow : AvantWindow<MainWindowViewModel>
             case nameof(WindowState):
                 App.Settings.IsMaximized = WindowState == WindowState.Maximized;
                 _writeSettingsFlag = true;
+
+                // A guest with a caret or an animation renders forever, and a minimized window is
+                // the one case where none of it can be seen. Withholding the frame acknowledgement
+                // stops the host rendering rather than merely discarding the result.
+                _loader.IsRenderPaused = WindowState == WindowState.Minimized;
                 break;
         }
     }

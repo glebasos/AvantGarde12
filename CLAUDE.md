@@ -31,11 +31,14 @@ previewer compatibility — that is Milestones 1 and 2.
   key, text and scroll forwarding: the same row proved **true** here, the guest-focus precondition
   it hides, and two defects only measurement found (consuming a `KeyDown` destroys the text that
   follows it; `PreviewControl`'s `x:Name` fields are all null).
+- **[AvantGarde/docs/milestone-4-fps-result.md](AvantGarde/docs/milestone-4-fps-result.md)** — frame
+  pacing: the host stalls until each frame is acknowledged and does not queue while it waits, so the
+  ack is a real throttle. Read before touching the frame path.
 
 ## Where things stand
 
-**Milestones 0–3 are done, and Milestone 4 items 1–4.** App on Avalonia 12.1.0 / net10.0,
-0 warnings (Debug *and* Release), 76/76 tests. Milestone 3 was done ahead of Milestones 1–2 at the
+**Milestones 0–3 are done, and Milestone 4 items 1–5.** App on Avalonia 12.1.0 / net10.0,
+0 warnings (Debug *and* Release), 84/84 tests. Milestone 3 was done ahead of Milestones 1–2 at the
 user's direction.
 
 Dependency outcomes, which differ from what PLAN.md assumes:
@@ -66,10 +69,16 @@ Evaluation costs ~0.6 s per project, so it is worker-thread only: `BeginEvaluati
 thread marks projects and shows "Resolving project...", then `Evaluate()` runs on a worker, then
 `Refresh()` applies. `UpdateLoader` defers previewing while it is in flight.
 
-**Milestone 4 items 5–8 are next** (FPS limiting, build on demand, shadow copy, theme injection),
-with Milestone 5's internal debt taken opportunistically. Item 5 has a concrete provocation now: a
-click into a guest `TextBox` leaves a caret blinking, which renders a frame about twice a second
-forever.
+**Milestone 4 items 6–8 are next** (build on demand, shadow copy, theme injection), with Milestone
+5's internal debt taken opportunistically.
+
+**Frames are paced by the ack, and the host stalls without one.** Measured: withhold
+`FrameReceivedMessage` and exactly one frame arrives, then nothing — and the host does not queue
+while it waits, so a held ack throttles its *rendering*, not just ours, and can never show a stale
+bitmap. `MaxFrameRate` (default 30) paces it; `IsRenderPaused`, wired to window minimize, withholds
+it outright. The cap does **not** bound the blinking caret and cannot — a caret renders at ~2 fps,
+under any useful cap — which is why the pause exists. Note also that the achieved rate sits well
+below the cap (24 against 30) because the Windows timer resolves to ~15 ms.
 
 **Input forwarding is in, and keyboard depends on the pointer.** The host routes key and text
 messages to whatever the *guest* has focused, and a guest that has never been clicked has focused
@@ -92,9 +101,11 @@ natural size is derived from `FrameMessage`'s own pixel size and DPI (self-descr
 drift) rather than from the resize message. Don't try to reply to that message; there is nothing it
 would change.
 
-`RemoteLoader` now has a **third** lock, `_viewportSync`, guarding scale and natural size. `Scale`
-used to take `_startSync`, which `UpdateThread` holds across a ~15 s host start — tolerable for a
-dropdown, a UI freeze once resizing drives scale. `_viewportSync` is always the inner lock.
+`RemoteLoader` now has **four** locks. `_viewportSync` guards scale and natural size: `Scale` used to
+take `_startSync`, which `UpdateThread` holds across a ~15 s host start — tolerable for a dropdown, a
+UI freeze once resizing drives scale. `_ackSync` guards the pending frame ack, its clock and its
+timer, written from the transport thread and a timer callback. Both are inner locks and neither is
+ever held across blocking work.
 
 The three Milestone 0 diagnostics in `RemoteLoader.cs` (explicit `--method avalonia-remote`; buffer
 all host output; capture output before `StopNoSync()`) are committed. Don't reimplement them — see
@@ -131,7 +142,7 @@ Everything before `808f084 v1.6.0` is upstream; the `wip` commits on top are thi
 
 ```
 dotnet build AvantGarde.sln          # must stay clean, zero new warnings
-dotnet test AvantGarde.Test          # 69 facts; still zero coverage of Loading/
+dotnet test AvantGarde.Test          # 84 facts; Loading/ covered only for InputMapper and FrameRateLimiter
 ```
 
 Two Avalonia 12.0.5 fixtures, in **different** places — the second is not where PLAN.md says:
@@ -169,12 +180,13 @@ differential probe) — copy the `Exec` line from
   range operators, or expression-bodied members. Match the surrounding file.
 - `Nullable` and `ImplicitUsings` are enabled; compiled bindings are on by default. Tabs in `.csproj`.
 - `RemoteLoader` concurrency: `v_`-prefixed fields are `volatile`, **not** lock-guarded — they are
-  touched from the host's process callbacks and the TCP thread. **Three** separate locks exist:
-  `_startSync` (lifecycle), `_outputSync` (the output ring buffer, incl. `AppendOutput`), and
-  `_viewportSync` (scale and natural size). Know which one applies before adding state; don't assume
-  `v_` means "protected." `_viewportSync` is always the **inner** lock — take it while holding
-  `_startSync`, never the reverse — and it must never be held across blocking work, which is the
-  whole reason scale was moved out of `_startSync`.
+  touched from the host's process callbacks and the TCP thread. **Four** separate locks exist:
+  `_startSync` (lifecycle), `_outputSync` (the output ring buffer, incl. `AppendOutput`),
+  `_viewportSync` (scale and natural size) and `_ackSync` (the pending frame ack, its clock and its
+  timer). Know which one applies before adding state; don't assume `v_` means "protected."
+  `_viewportSync` and `_ackSync` are always **inner** locks — take them while holding `_startSync`,
+  never the reverse — and neither may be held across blocking work, which is the whole reason scale
+  was moved out of `_startSync`.
 - Upstream comment style is sparse; the migration comments explaining *why* a non-obvious workaround
   exists (as in `RemoteLoader.ProcessOutputHandler`) are deliberate. Match that: explain the
   non-obvious, not the obvious.

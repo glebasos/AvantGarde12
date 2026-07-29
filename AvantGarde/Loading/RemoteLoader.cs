@@ -52,6 +52,12 @@ public sealed class RemoteLoader : IDisposable
     // own stdout and stderr in the same buffer.
     private const string OutputPrefix = "[AvantGarde] ";
 
+    // Frames a second the designer host is allowed to deliver. See FrameRateLimiter: the host waits
+    // for each frame to be acknowledged, so this throttles its rendering and not just ours. An
+    // animated control renders at about 43 fps unpaced, and a full uncompressed bitmap crosses the
+    // socket for every one of them.
+    private const int DefaultFrameRate = 30;
+
     // Dips of slack allowed before a re-derived natural size is taken as a real change. See
     // DeriveNaturalSize - it absorbs the rounding of a frame divided by a fractional DPI, nothing
     // larger.
@@ -75,6 +81,12 @@ public sealed class RemoteLoader : IDisposable
     // may take it while holding _startSync, never the reverse.
     private readonly object _viewportSync = new();
 
+    // Guards the pending frame acknowledgement and its pacing. Separate from the others because the
+    // ack is written from the transport thread and from a timer callback, and neither has any
+    // business waiting on the lifecycle or the viewport. Like _viewportSync it is an inner lock and
+    // is never held across blocking work - the send is fired outside it.
+    private readonly object _ackSync = new();
+
     private readonly List<string> _output = new();
     private readonly HashSet<string> _reported = new();
 
@@ -94,12 +106,34 @@ public sealed class RemoteLoader : IDisposable
     private volatile bool v_xamlPending;
     private volatile bool v_scalePending;
 
+    private volatile int v_maxFrameRate = DefaultFrameRate;
+    private volatile bool v_renderPaused;
+
     // All under _viewportSync.
     private double _scale = 1.0;
     private double _naturalWidth = double.NaN;
     private double _naturalHeight = double.NaN;
     private bool _naturalLatched;
 
+    // All under _ackSync. The clock is monotonic and runs for the lifetime of the loader; the
+    // connection doubles as the "an ack is pending" flag.
+    private readonly Stopwatch _ackClock = Stopwatch.StartNew();
+    private readonly System.Threading.Timer _ackTimer;
+    private IAvaloniaRemoteTransportConnection? _ackConnection;
+    private long _ackSequence;
+    private long _ackLast = -1;
+
+
+    /// <summary>
+    /// Constructor.
+    /// </summary>
+    public RemoteLoader()
+    {
+        // One timer for the life of the loader, rescheduled rather than recreated. A frame is
+        // acknowledged either as it arrives or by this, never both - see AckFrame.
+        _ackTimer = new System.Threading.Timer(AckTimerHandler, null,
+            System.Threading.Timeout.Infinite, System.Threading.Timeout.Infinite);
+    }
 
     /// <summary>
     /// Occurs when preview has been generated. The event is invoked in the UI thread.
@@ -127,6 +161,49 @@ public sealed class RemoteLoader : IDisposable
     {
         get { return v_maxOutputLines; }
         set { v_maxOutputLines = value; }
+    }
+
+    /// <summary>
+    /// Gets or sets the maximum number of frames a second the designer host may deliver. A value of
+    /// 0 or less disables the limit. See <see cref="FrameRateLimiter"/>.
+    /// </summary>
+    public int MaxFrameRate
+    {
+        get { return v_maxFrameRate; }
+        set { v_maxFrameRate = Math.Min(value, FrameRateLimiter.MaxRate); }
+    }
+
+    /// <summary>
+    /// Gets or sets whether frame acknowledgement is withheld entirely, which stops the designer
+    /// host rendering. Intended for when the preview cannot be seen at all, such as a minimized
+    /// window. Clearing it releases the held frame immediately.
+    /// </summary>
+    /// <remarks>
+    /// This is what actually bounds an idle guest. A rate limit cannot: a blinking caret renders
+    /// about twice a second, which is under any frame rate worth setting, so the frames go on
+    /// regardless. Nothing on this side can stop the guest animating - the only lever is refusing
+    /// to take delivery.
+    ///
+    /// The last frame received is still displayed while paused, and any XAML update sent meanwhile
+    /// is still compiled by the host and still reports its errors. Only the picture waits.
+    /// </remarks>
+    public bool IsRenderPaused
+    {
+        get { return v_renderPaused; }
+
+        set
+        {
+            if (v_renderPaused != value)
+            {
+                v_renderPaused = value;
+                Debug.WriteLine("Render paused: " + value);
+
+                if (!value)
+                {
+                    FlushAck();
+                }
+            }
+        }
     }
 
     /// <summary>
@@ -398,6 +475,7 @@ public sealed class RemoteLoader : IDisposable
             {
                 v_disposed = true;
                 StopNoSync();
+                _ackTimer.Dispose();
             }
             catch
             {
@@ -645,6 +723,15 @@ public sealed class RemoteLoader : IDisposable
         v_sessionMismatch = false;
         v_xamlPending = false;
         v_scalePending = false;
+
+        // Any frame still awaiting acknowledgement belonged to the host being stopped. The clock is
+        // reset with it so the next host's first frame is acknowledged at once.
+        lock (_ackSync)
+        {
+            _ackTimer.Change(System.Threading.Timeout.Infinite, System.Threading.Timeout.Infinite);
+            _ackConnection = null;
+            _ackLast = -1;
+        }
 
         // The natural size belongs to the control the host had loaded. A new host will restate it.
         lock (_viewportSync)
@@ -1094,8 +1181,119 @@ public sealed class RemoteLoader : IDisposable
             }
         }
 
+        // The frame itself is always processed as it arrives. Only the acknowledgement is paced,
+        // because that is what governs when the host renders the next one.
+        AckFrame(cnx, frame.SequenceId);
+    }
+
+    /// <summary>
+    /// Acknowledges a frame, immediately or after a delay, or not at all while paused.
+    /// </summary>
+    /// <remarks>
+    /// There is one pending slot and it holds the newest sequence number, never a queue. The 12.0.5
+    /// host sends one frame at a time and waits, so it can have at most one outstanding anyway, but
+    /// acknowledging a superseded frame would leave a host that did otherwise waiting forever.
+    ///
+    /// The connection is captured here rather than read from v_connection in the timer callback: a
+    /// host restarted during the delay must not be sent an acknowledgement for the previous host's
+    /// frame.
+    /// </remarks>
+    private void AckFrame(IAvaloniaRemoteTransportConnection cnx, long sequenceId)
+    {
+        IAvaloniaRemoteTransportConnection? send;
+        long seq;
+
+        lock (_ackSync)
+        {
+            if (v_disposed)
+            {
+                // A message can still be in flight while Dispose runs, and the timer is gone.
+                return;
+            }
+
+            _ackConnection = cnx;
+            _ackSequence = sequenceId;
+
+            if (v_renderPaused)
+            {
+                // No timer is scheduled. IsRenderPaused releases it.
+                Debug.WriteLine($"Ack withheld - paused: {sequenceId}");
+                return;
+            }
+
+            int interval = FrameRateLimiter.GetInterval(v_maxFrameRate);
+            int delay = FrameRateLimiter.GetDelay(_ackLast, _ackClock.ElapsedMilliseconds, interval);
+
+            if (delay > 0)
+            {
+                Debug.WriteLine($"Ack deferred {delay}ms: {sequenceId}");
+                _ackTimer.Change(delay, System.Threading.Timeout.Infinite);
+                return;
+            }
+
+            TakeAckNoSync(out send, out seq);
+        }
+
+        SendAck(send, seq);
+    }
+
+    private void AckTimerHandler(object? state)
+    {
+        IAvaloniaRemoteTransportConnection? send;
+        long seq;
+
+        lock (_ackSync)
+        {
+            if (v_renderPaused || !TakeAckNoSync(out send, out seq))
+            {
+                // Paused since the timer was scheduled, or the frame was acknowledged by another
+                // path. Either way the pending slot is still owed an ack and FlushAck will pay it.
+                return;
+            }
+        }
+
+        SendAck(send, seq);
+    }
+
+    private void FlushAck()
+    {
+        IAvaloniaRemoteTransportConnection? send;
+        long seq;
+
+        lock (_ackSync)
+        {
+            if (!TakeAckNoSync(out send, out seq))
+            {
+                return;
+            }
+        }
+
+        SendAck(send, seq);
+    }
+
+    /// <summary>
+    /// Under <see cref="_ackSync"/>. Clears the pending slot and records the time, returning false
+    /// if there was nothing pending.
+    /// </summary>
+    private bool TakeAckNoSync(out IAvaloniaRemoteTransportConnection? cnx, out long sequenceId)
+    {
+        cnx = _ackConnection;
+        sequenceId = _ackSequence;
+
+        if (cnx == null)
+        {
+            return false;
+        }
+
+        _ackConnection = null;
+        _ackLast = _ackClock.ElapsedMilliseconds;
+        return true;
+    }
+
+    private void SendAck(IAvaloniaRemoteTransportConnection? cnx, long sequenceId)
+    {
         var resp = new FrameReceivedMessage();
-        resp.SequenceId = frame.SequenceId;
+        resp.SequenceId = sequenceId;
         Send(cnx, resp);
     }
 
