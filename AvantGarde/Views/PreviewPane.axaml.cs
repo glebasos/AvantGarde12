@@ -63,6 +63,7 @@ public partial class PreviewPane : UserControl
         PreviewControl.KeyboardEventOccurred += KeyboardEventHandler;
         PreviewControl.WheelEventOccurred += WheelEventHandler;
         PreviewControl.GotoClick += GotoClickHander;
+        PreviewControl.BuildClick += BuildClickHandler;
 
         _timer = new(TimeSpan.FromMilliseconds(100), DispatcherPriority.Normal, TimerHandler);
         _timer.Start();
@@ -81,6 +82,11 @@ public partial class PreviewPane : UserControl
     /// Occurs when user clicks restart/refresh.
     /// </summary>
     public event Action? RestartClicked;
+
+    /// <summary>
+    /// Occurs when the user clicks Build on a missing assembly error.
+    /// </summary>
+    public event Action? BuildClicked;
 
     /// <summary>
     /// Occurs when scale is changed.
@@ -129,6 +135,15 @@ public partial class PreviewPane : UserControl
     {
         get { return _model.HasSolution; }
         set { _model.HasSolution = value; }
+    }
+
+    /// <summary>
+    /// Gets or sets whether the Build button is enabled. It is disabled while a build runs.
+    /// </summary>
+    public bool IsBuildEnabled
+    {
+        get { return PreviewControl.IsBuildEnabled; }
+        set { PreviewControl.IsBuildEnabled = value; }
     }
 
     /// <summary>
@@ -242,6 +257,18 @@ public partial class PreviewPane : UserControl
     {
         get { return XamlCode.OutputText; }
         set { XamlCode.OutputText = value; }
+    }
+
+    /// <summary>
+    /// Opens the code view with the OUTPUT tab selected. The split does not necessarily open at
+    /// once: a transient message such as "Building..." is not a XAML item, so the code view is not
+    /// viewable while one is showing and <see cref="ResetSplitter"/> keeps the row closed. It opens
+    /// on the next update that does carry XAML, which is what a caller at the end of a build wants.
+    /// </summary>
+    public void ShowOutput()
+    {
+        XamlCode.ShowOutput();
+        IsXamlViewOpen = true;
     }
 
     /// <summary>
@@ -526,6 +553,20 @@ public partial class PreviewPane : UserControl
         try
         {
             FitScaleChanged?.Invoke();
+        }
+        catch (Exception e)
+        {
+            Debug.WriteLine(e);
+        }
+    }
+
+    private void BuildClickHandler()
+    {
+        Debug.WriteLine(nameof(PreviewPane) + "." + nameof(BuildClickHandler));
+
+        try
+        {
+            BuildClicked?.Invoke();
         }
         catch (Exception e)
         {

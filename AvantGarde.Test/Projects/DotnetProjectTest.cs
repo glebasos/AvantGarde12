@@ -176,6 +176,21 @@ public class DotnetProjectTest(ITestOutputHelper helper) : TestUtilBase(helper)
         Assert.False(item.IsRestored);
         Assert.Null(item.PreviewerToolPath);
         Assert.Equal("Project not restored", item.Error?.Message);
+
+        // Building would restore too, but the affordance is attached to the missing assembly alone.
+        Assert.False(item.Error?.IsBuildable);
+    }
+
+    [Fact]
+    public void CheckForError_MissingAssemblyIsBuildable()
+    {
+        var path = CreateFileContent("Name.Test.csproj", ProjectNet6);
+        var item = new DotnetProject(path);
+        item.Refresh();
+
+        // The one error AvantGarde can clear itself, and the only one carrying a Build button.
+        Assert.Equal("Debug assembly not found", item.Error?.Message);
+        Assert.True(item.Error?.IsBuildable);
     }
 
     [Fact]

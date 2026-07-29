@@ -72,6 +72,20 @@ public partial class PreviewControl : UserControl
     public Action<PreviewError>? GotoClick;
 
     /// <summary>
+    /// Occurs when the user clicks on "Build" to clear a missing assembly.
+    /// </summary>
+    public Action? BuildClick;
+
+    /// <summary>
+    /// Gets or sets whether the Build button is enabled. It is disabled while a build runs.
+    /// </summary>
+    public bool IsBuildEnabled
+    {
+        get { return _model.IsBuildEnabled; }
+        set { _model.IsBuildEnabled = value; }
+    }
+
+    /// <summary>
     /// Gets or sets the preview window color.
     /// </summary>
     public PreviewWindowTheme WindowTheme
@@ -167,12 +181,14 @@ public partial class PreviewControl : UserControl
         {
             Debug.WriteLine("Error line: " + payload.Error.LineNum);
             _model.HasErrorLocation = payload.Error.LineNum > 0;
+            _model.HasBuildAction = payload.Error.CanBuild;
             _model.MessageText = payload.Error.Message;
             _model.MainImage ??= GlobalModel.Global.Assets.WarnIcon;
         }
         else
         {
             _model.HasErrorLocation = false;
+            _model.HasBuildAction = false;
             _model.MessageText = _model.MainImage == null ? "None" : null;
         }
     }
@@ -383,5 +399,10 @@ public partial class PreviewControl : UserControl
         {
             GotoClick?.Invoke(Payload.Error);
         }
+    }
+
+    private void BuildClickHandler(object? sender, RoutedEventArgs e)
+    {
+        BuildClick?.Invoke();
     }
 }

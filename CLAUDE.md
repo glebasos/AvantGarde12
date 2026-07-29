@@ -34,11 +34,14 @@ previewer compatibility — that is Milestones 1 and 2.
 - **[AvantGarde/docs/milestone-4-fps-result.md](AvantGarde/docs/milestone-4-fps-result.md)** — frame
   pacing: the host stalls until each frame is acknowledged and does not queue while it waits, so the
   ack is a real throttle. Read before touching the frame path.
+- **[AvantGarde/docs/milestone-4-build-result.md](AvantGarde/docs/milestone-4-build-result.md)** —
+  build on demand, and why the post-build recovery belongs to `RefreshTimerHandler` rather than to
+  the build. Read before adding anything that restarts the preview.
 
 ## Where things stand
 
-**Milestones 0–3 are done, and Milestone 4 items 1–5.** App on Avalonia 12.1.0 / net10.0,
-0 warnings (Debug *and* Release), 84/84 tests. Milestone 3 was done ahead of Milestones 1–2 at the
+**Milestones 0–3 are done, and Milestone 4 items 1–6.** App on Avalonia 12.1.0 / net10.0,
+0 warnings (Debug *and* Release), 92/92 tests. Milestone 3 was done ahead of Milestones 1–2 at the
 user's direction.
 
 Dependency outcomes, which differ from what PLAN.md assumes:
@@ -69,8 +72,16 @@ Evaluation costs ~0.6 s per project, so it is worker-thread only: `BeginEvaluati
 thread marks projects and shows "Resolving project...", then `Evaluate()` runs on a worker, then
 `Refresh()` applies. `UpdateLoader` defers previewing while it is in flight.
 
-**Milestone 4 items 6–8 are next** (build on demand, shadow copy, theme injection), with Milestone
-5's internal debt taken opportunistically.
+**Milestone 4 items 7–8 are next** (shadow copy, theme injection), with Milestone 5's internal debt
+taken opportunistically.
+
+**A build started from AvantGarde must not restart the preview itself.** `ProjectBuilder` shells
+`dotnet build`; `MainWindow.BuildProject` stops the host, suspends, and then hands recovery to
+`RefreshTimerHandler`, which already implements "a build just happened". Restarting from the build's
+own completion hits `UpdateLoader`'s `"Please wait..."` branch, because a build resets the
+`BuildWatcher` clock that guard reads. The converse also holds: `RefreshTimerHandler` returns early
+while `_isBuilding`, or its un-suspend branch fires in the quiet stretch before MSBuild writes
+anything and starts a host against the assembly being replaced.
 
 **Frames are paced by the ack, and the host stalls without one.** Measured: withhold
 `FrameReceivedMessage` and exactly one frame arrives, then nothing — and the host does not queue
@@ -142,7 +153,7 @@ Everything before `808f084 v1.6.0` is upstream; the `wip` commits on top are thi
 
 ```
 dotnet build AvantGarde.sln          # must stay clean, zero new warnings
-dotnet test AvantGarde.Test          # 84 facts; Loading/ covered only for InputMapper and FrameRateLimiter
+dotnet test AvantGarde.Test          # 92 facts; Loading/ covered only for InputMapper, FrameRateLimiter, PreviewFactory errors
 ```
 
 Two Avalonia 12.0.5 fixtures, in **different** places — the second is not where PLAN.md says:
@@ -165,6 +176,9 @@ Driving the app without clicking (this is how Milestone 0 part 2 was done — se
   full internal trace (discovery steps, every protocol message type, frame sizes).
 - `AvantGarde.exe <sln|csproj|file> -s=<leaf name>` opens and selects, no UI interaction.
 - Screenshot with `PrintWindow` + `PW_RENDERFULLCONTENT` (flag `2`); `CopyFromScreen` returns black.
+- **Clicking** is scriptable too: the window exposes UI Automation on Windows, so PowerShell with
+  `Add-Type -AssemblyName UIAutomationClient` can `FindFirst` a control by its `NameProperty` and
+  invoke `InvokePattern`. This is how the Build button was exercised — see the milestone-4-build note.
 - `Get-CimInstance Win32_Process | ? CommandLine -like '*Designer.HostApp*'` shows which designer
   host TFM was actually launched.
 

@@ -51,7 +51,7 @@ public class PreviewFactory
 
         if (load.Error != null)
         {
-            _source.Error = new PreviewError(load.Error.Message);
+            _source.Error = new PreviewError(load.Error);
         }
 
         if (!load.IsEmpty && load.FullPath != null)

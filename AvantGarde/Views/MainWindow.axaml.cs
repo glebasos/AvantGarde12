@@ -17,6 +17,7 @@
 // -----------------------------------------------------------------------------
 
 using System.Diagnostics;
+using System.Text;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
@@ -37,7 +38,9 @@ public partial class MainWindow : AvantWindow<MainWindowViewModel>
     private readonly SolutionCache _cache = new();
     private readonly RemoteLoader _loader;
     private readonly DispatcherTimer _refreshTimer;
+    private readonly StringBuilder _buildOutput = new();
     private bool _writeSettingsFlag;
+    private bool _isBuilding;
 
     // Added to watch for build changes
     private BuildWatcher? _buildWatcher;
@@ -61,6 +64,7 @@ public partial class MainWindow : AvantWindow<MainWindowViewModel>
         PreviewPane.ScaleChanged += ScaleChangedHandler;
         PreviewPane.LoadFlagChecked += LoadFlagCheckedHandler;
         PreviewPane.RestartClicked += RestartHost;
+        PreviewPane.BuildClicked += BuildProject;
         PreviewPane.PointerEventOccurred += PointerEventHandler;
         PreviewPane.KeyboardEventOccurred += KeyboardEventHandler;
         PreviewPane.FitScaleChanged += FitScaleChangedHandler;
@@ -266,6 +270,79 @@ public partial class MainWindow : AvantWindow<MainWindowViewModel>
         UpdateLoader(ExplorerPane.SelectedItem);
     }
 
+    /// <summary>
+    /// Builds the selected project in the solution's build configuration, so that the user does not
+    /// have to leave AvantGarde to clear a "assembly not found" error. Output goes to the OUTPUT
+    /// pane as it arrives.
+    /// </summary>
+    public async void BuildProject()
+    {
+        var project = ExplorerPane.SelectedProject;
+
+        if (project == null || _isBuilding)
+        {
+            return;
+        }
+
+        // The configuration must be the one the previewer looks in, not simply Debug - otherwise a
+        // solution set to Release builds Debug and reports the same missing assembly afterwards.
+        var path = project.FullName;
+        var build = project.Solution.Properties.Build;
+
+        Debug.WriteLine($"{nameof(MainWindow)}.{nameof(BuildProject)} {path}, {build}");
+
+        // Everything from here is guarded. The flag holds RefreshTimerHandler off, so leaving it set
+        // on an exception would stop the application refreshing anything ever again.
+        _isBuilding = true;
+
+        try
+        {
+            PreviewPane.IsBuildEnabled = false;
+
+            lock (_buildOutput)
+            {
+                _buildOutput.Clear();
+            }
+
+            // The designer host holds the output assembly open, so it has to stop before MSBuild can
+            // overwrite it - the same reason BuildWatcher stops it for a build started elsewhere.
+            PreviewPane.IsPreviewSuspended = true;
+            _loader.Stop();
+            _loader.Update(new LoadPayload(new ProjectError("Building " + project.ProjectName + "...")));
+
+            var rslt = await Task.Run(() => { return ProjectBuilder.Build(path, build, AppendBuildOutput); });
+            Debug.WriteLine("BUILD RESULT: " + rslt);
+
+            if (!rslt.IsSuccess)
+            {
+                AppendBuildOutput(rslt.Detail != null ? rslt.Message + ": " + rslt.Detail : rslt.Message ?? "Build failed");
+
+                // The compiler diagnostics are the only thing that says why, and the pane they are
+                // in is closed by default.
+                PreviewPane.ShowOutput();
+            }
+
+            // Re-runs FindTargetAssembly, so a successful build clears the error. The preview itself
+            // is left to RefreshTimerHandler, which already implements "a build just happened": it
+            // waits for the output directory to stop changing before restarting the host. Restarting
+            // here instead would race the tail of the build and report "Please wait...".
+            ExplorerPane.Refresh(true);
+        }
+        catch (Exception e)
+        {
+            // Nothing above is expected to throw - ProjectBuilder returns failures rather than
+            // raising them - so this is the last resort rather than a control path.
+            Debug.WriteLine(e);
+            AppendBuildOutput(e.Message);
+            PreviewPane.ShowOutput();
+        }
+        finally
+        {
+            _isBuilding = false;
+            PreviewPane.IsBuildEnabled = true;
+        }
+    }
+
     public void ToggleXamlView()
     {
         PreviewPane.IsXamlViewOpen = !PreviewPane.IsXamlViewOpen;
@@ -423,6 +500,39 @@ public partial class MainWindow : AvantWindow<MainWindowViewModel>
         Model.HasImage = PreviewPane.Update(payload) && payload?.Source != null;
         Model.IsXamlViewable = PreviewPane.IsXamlViewable;
         Model.IsPlainTextViewable = PreviewPane.IsPlainTextViewable;
+
+        if (string.IsNullOrEmpty(payload?.Output))
+        {
+            // The pane takes its output from the payload, and every payload until the designer host
+            // has started carries none - which would wipe the build log while it is still the only
+            // account of what happened. Reasserted rather than merged, because the host's own output
+            // supersedes it as soon as there is any.
+            RestoreBuildOutput();
+        }
+    }
+
+    /// <summary>
+    /// Appends a line of build output. Called from the build's own thread.
+    /// </summary>
+    private void AppendBuildOutput(string line)
+    {
+        lock (_buildOutput)
+        {
+            _buildOutput.AppendLine(line);
+        }
+
+        Dispatcher.UIThread.Post(RestoreBuildOutput);
+    }
+
+    private void RestoreBuildOutput()
+    {
+        lock (_buildOutput)
+        {
+            if (_buildOutput.Length != 0)
+            {
+                PreviewPane.OutputText = _buildOutput.ToString().TrimEnd();
+            }
+        }
     }
 
     private void OutputReceivedHandler(string output)
@@ -576,6 +686,15 @@ public partial class MainWindow : AvantWindow<MainWindowViewModel>
 
     private void RefreshTimerHandler(object? _, EventArgs e)
     {
+        if (_isBuilding)
+        {
+            // A build owns the preview state while it runs. The watcher is watching the output
+            // directory being rewritten under it, and the suspension-clearing branch below would
+            // otherwise fire during the quiet stretch before MSBuild writes anything and start a
+            // host against the assembly being replaced.
+            return;
+        }
+
         try
         {
             bool refreshed = ExplorerPane.Refresh();

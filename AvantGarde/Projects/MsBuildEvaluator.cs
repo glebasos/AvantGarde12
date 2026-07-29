@@ -252,7 +252,11 @@ public static class MsBuildEvaluator
         }
     }
 
-    private static string GetDotnetPath()
+    /// <summary>
+    /// Returns the dotnet executable to shell. Shared with <see cref="ProjectBuilder"/>, which runs
+    /// the same host against the same project.
+    /// </summary>
+    internal static string GetDotnetPath()
     {
         // https://github.com/dotnet/docs/blob/main/docs/core/tools/dotnet-environment-variables.md#dotnet_host_path
         var dotnet = Environment.GetEnvironmentVariable("DOTNET_HOST_PATH");

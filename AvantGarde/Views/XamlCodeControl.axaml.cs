@@ -62,6 +62,14 @@ public partial class XamlCodeControl : UserControl
     }
 
     /// <summary>
+    /// Selects the OUTPUT tab.
+    /// </summary>
+    public void ShowOutput()
+    {
+        _model.IsOutputChecked = true;
+    }
+
+    /// <summary>
     /// Updates. Returns true if <see cref="HasXaml"/> changes.
     /// </summary>
     public bool Update(PreviewPayload? payload)
