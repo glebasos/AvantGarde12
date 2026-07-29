@@ -15,6 +15,12 @@ Measured against both fixtures. The contrast is the point:
 | Shadow copy off | 12 × `MSB3061 ... locked by ".NET Host"` | replaced, then restarted |
 | Shadow copy on | none | never interrupted |
 
+Note what the left column does *not* say. **Both builds succeeded.** With the copy off, MSBuild fails
+to delete the previewer's assemblies, retries, and gets through only because `BuildWatcher` tears the
+host down partway — the preview is the price of the build succeeding. With the copy on there is
+nothing to tear down and nothing to retry. The claim measured here is the removal of the teardown and
+the retries, not the removal of a build failure.
+
 ## What shipped
 
 - **`Loading/ShadowCopier.cs`** — mirrors a directory incrementally and remaps paths into the
@@ -102,8 +108,11 @@ needs the case rule the file system actually applies, or a mirror is silently no
 
 ## Where the copies go, and who cleans up
 
-A root is claimed by process id and deleted on `Dispose`. On the first mirror of a session, roots
-belonging to process ids that are no longer live are swept.
+A root is claimed by process id and deleted on `Dispose`. Roots belonging to process ids that are no
+longer live are swept once per session, from the `RemoteLoader` constructor on a worker thread —
+deliberately not from the first mirror, and deliberately not conditional on the setting. A root
+stranded by a crash would otherwise sit there until some later session happened to turn the option
+back on, which is a plausible sequence precisely because the option is one a user tries and drops.
 
 Liveness decides, and deletability deliberately does not. Testing whether a sibling root's files can
 be deleted would look like a neat way to detect a live instance, but a running host locks only the
@@ -156,3 +165,8 @@ Both fixtures, driven with `AvantGarde.exe <sln> -s=<leaf>` and the trace captur
   `AvaloniaApp1`.
 - Cleanup: a killed instance's root swept by the next launch; a gracefully closed instance removes
   its own.
+- The setting itself, through the dialog rather than through the JSON: Preferences opens with the box
+  reflecting the stored value, ticking it and pressing OK writes `IsShadowCopy: true`, the running
+  loader picks it up for its next host start, and a fresh launch starts its host from the mirror —
+  which is the read path (`AppSettings.AssignFrom`, where a new property is easy to forget) proved
+  from the other end.

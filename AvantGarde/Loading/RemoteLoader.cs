@@ -144,6 +144,12 @@ public sealed class RemoteLoader : IDisposable
         // acknowledged either as it arrives or by this, never both - see AckFrame.
         _ackTimer = new System.Threading.Timer(AckTimerHandler, null,
             System.Threading.Timeout.Infinite, System.Threading.Timeout.Infinite);
+
+        // Deliberately not conditional on shadow copy being enabled, and deliberately not left to
+        // the first mirror. A root stranded by a crash would otherwise sit in the temporary
+        // directory until some later session happened to turn the option back on. It enumerates
+        // and deletes directories, so it does not belong on the calling thread.
+        ThreadPool.QueueUserWorkItem(SweepShadowRoots, null);
     }
 
     /// <summary>
@@ -1023,13 +1029,8 @@ public sealed class RemoteLoader : IDisposable
         {
             var clock = Stopwatch.StartNew();
 
-            if (_copier == null)
-            {
-                _copier = new ShadowCopier();
-                ShadowCopier.SweepStaleRoots(ShadowCopier.GetDefaultParent(),
-                    Path.GetFileName(_copier.Root));
-            }
-
+            // Stale roots are swept once per session from the constructor, not here.
+            _copier ??= new ShadowCopier();
             _copier.Mirror(appDir);
 
             var projDir = GetDirectoryOrNull(load.ProjectAssembly);
@@ -1058,6 +1059,12 @@ public sealed class RemoteLoader : IDisposable
             AppendAppOutput("Shadow copy failed, running from the build output instead - " + e.Message);
             return null;
         }
+    }
+
+    private static void SweepShadowRoots(object? state)
+    {
+        ShadowCopier.SweepStaleRoots(ShadowCopier.GetDefaultParent(),
+            Path.GetFileName(ShadowCopier.GetDefaultRoot()));
     }
 
     private static string? GetDirectoryOrNull(string? file)
